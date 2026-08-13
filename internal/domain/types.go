@@ -83,6 +83,38 @@ type Assignment struct {
 	Volumes        []Volume  `json:"volumes"`
 }
 
+// AssignmentLifecycle describes whether an immutable assignment generation is
+// merely being prepared, ready for an authority cutover, currently
+// authoritative, or historical. Preparing and arming never authorize flight.
+type AssignmentLifecycle string
+
+const (
+	AssignmentReceived   AssignmentLifecycle = "candidate_received"
+	AssignmentArmed      AssignmentLifecycle = "candidate_armed"
+	AssignmentActive     AssignmentLifecycle = "active"
+	AssignmentEnding     AssignmentLifecycle = "ending"
+	AssignmentCompleted  AssignmentLifecycle = "completed"
+	AssignmentCancelled  AssignmentLifecycle = "cancelled"
+	AssignmentSuperseded AssignmentLifecycle = "superseded"
+)
+
+// AssignmentRecord pairs an immutable assignment with its authority interval.
+// AuthorityUntil is exclusive: an observation exactly at a cutover belongs to
+// the replacement generation.
+type AssignmentRecord struct {
+	Assignment     Assignment          `json:"assignment"`
+	Lifecycle      AssignmentLifecycle `json:"lifecycle"`
+	AuthorityFrom  *time.Time          `json:"authority_from,omitempty"`
+	AuthorityUntil *time.Time          `json:"authority_until,omitempty"`
+	PreparedAt     time.Time           `json:"prepared_at"`
+	ArmedAt        *time.Time          `json:"armed_at,omitempty"`
+	CutoverAt      *time.Time          `json:"cutover_at,omitempty"`
+}
+
+func (r AssignmentRecord) Authorizes(observedAt time.Time) bool {
+	return r.AuthorityFrom != nil && !observedAt.Before(*r.AuthorityFrom) && (r.AuthorityUntil == nil || observedAt.Before(*r.AuthorityUntil))
+}
+
 // Observation is one normalized GLOBAL_POSITION_INT record read from InfluxDB.
 type Observation struct {
 	FrameID           string            `json:"frame_id"`

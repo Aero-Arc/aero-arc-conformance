@@ -22,9 +22,11 @@ import (
 )
 
 var (
-	ErrLeaseLost       = errors.New("conformance assignment lease lost")
-	ErrMessageConflict = errors.New("inbox message ID reused with different payload")
-	ErrStaleEvaluation = errors.New("evaluation is older than the current live watermark")
+	ErrLeaseLost         = errors.New("conformance assignment lease lost")
+	ErrMessageConflict   = errors.New("inbox message ID reused with different payload")
+	ErrStaleEvaluation   = errors.New("evaluation is older than the current live watermark")
+	ErrInvalidTransition = errors.New("invalid assignment lifecycle transition")
+	ErrStaleAssignment   = errors.New("assignment generation is stale")
 )
 
 type Store struct{ pool *pgxpool.Pool }
@@ -66,7 +68,10 @@ type ApplyResult struct {
 	Assignment  domain.Assignment
 }
 
-func (s *Store) ApplyAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
+// PrepareAssignment stores a candidate generation without changing the
+// currently authoritative assignment. A prepared generation must be armed and
+// explicitly cut over before workers may evaluate it.
+func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
 	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(messageType) == "" || strings.TrimSpace(assignment.ID) == "" || assignment.Generation == 0 || assignment.Generation > math.MaxInt64 || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) {
 		return ApplyResult{}, fmt.Errorf("assignment envelope is invalid")
 	}
@@ -83,11 +88,14 @@ func (s *Store) ApplyAssignment(ctx context.Context, source, messageID, messageT
 	}
 	hashBytes := sha256.Sum256(envelope)
 	hash := hex.EncodeToString(hashBytes[:])
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// The per-assignment advisory lock serializes generation changes. Read
+	// committed is intentional: a transaction waiting on that lock must observe
+	// the command committed by its predecessor for idempotent concurrent retries.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("begin apply assignment: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	// Serialize all generations for one logical assignment, including the case
 	// where no row exists yet. Terminal rows must continue fencing stale events.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, assignment.ID); err != nil {
@@ -111,7 +119,8 @@ func (s *Store) ApplyAssignment(ctx context.Context, source, messageID, messageT
 
 	var current uint64
 	var sameSpecification bool
-	err = tx.QueryRow(ctx, `SELECT assignment_generation,specification=$2::jsonb FROM conformance_assignments WHERE assignment_id=$1 ORDER BY assignment_generation DESC LIMIT 1 FOR UPDATE`, assignment.ID, payload).Scan(&current, &sameSpecification)
+	var currentAircraftID, currentFlightID, currentIntentID string
+	err = tx.QueryRow(ctx, `SELECT assignment_generation,specification=$2::jsonb,aircraft_id,flight_id,intent_id FROM conformance_assignments WHERE assignment_id=$1 ORDER BY assignment_generation DESC LIMIT 1 FOR UPDATE`, assignment.ID, payload).Scan(&current, &sameSpecification, &currentAircraftID, &currentFlightID, &currentIntentID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return ApplyResult{}, fmt.Errorf("read live assignment: %w", err)
 	}
@@ -136,25 +145,349 @@ func (s *Store) ApplyAssignment(ctx context.Context, source, messageID, messageT
 		}
 		return ApplyResult{Disposition: ApplyIdempotent, Assignment: assignment}, nil
 	}
+	// The logical assignment identity is immutable even after every previous
+	// generation becomes terminal. Otherwise a delayed higher generation could
+	// reuse an old assignment ID for unrelated authority.
+	if err == nil && (assignment.AircraftID != currentAircraftID || assignment.FlightID != currentFlightID || assignment.IntentID != currentIntentID) {
+		return ApplyResult{}, fmt.Errorf("assignment generation changed stable aircraft, flight, or intent identity: %w", ErrMessageConflict)
+	}
+	var replacedGeneration uint64
+	var replacedState string
+	replacedErr := tx.QueryRow(ctx, `SELECT assignment_generation,lifecycle_state FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('candidate_received','candidate_armed') FOR UPDATE`, assignment.ID).Scan(&replacedGeneration, &replacedState)
+	if replacedErr != nil && !errors.Is(replacedErr, pgx.ErrNoRows) {
+		return ApplyResult{}, fmt.Errorf("read candidate assignment: %w", replacedErr)
+	}
 	if err == nil {
-		if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='superseded', lease_owner=NULL, lease_until=NULL, updated_at=now() WHERE assignment_id=$1 AND lifecycle_state IN ('received','armed','active','ending')`, assignment.ID); err != nil {
+		// A newer candidate replaces only another candidate. The active generation
+		// remains authoritative until an explicit cutover transaction.
+		if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='superseded', lease_owner=NULL, lease_until=NULL, updated_at=now() WHERE assignment_id=$1 AND lifecycle_state IN ('candidate_received','candidate_armed')`, assignment.ID); err != nil {
 			return ApplyResult{}, err
 		}
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO conformance_assignments(assignment_id,assignment_generation,aircraft_id,agent_id,flight_id,intent_id,intent_version,policy_version,lifecycle_state,specification) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'received',$9)`, assignment.ID, assignment.Generation, assignment.AircraftID, assignment.AgentID, assignment.FlightID, assignment.IntentID, assignment.IntentVersion, assignment.PolicyVersion, payload); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_assignments(assignment_id,assignment_generation,aircraft_id,agent_id,flight_id,intent_id,intent_version,policy_version,lifecycle_state,specification) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'candidate_received',$9)`, assignment.ID, assignment.Generation, assignment.AircraftID, assignment.AgentID, assignment.FlightID, assignment.IntentID, assignment.IntentVersion, assignment.PolicyVersion, payload); err != nil {
 		return ApplyResult{}, fmt.Errorf("insert assignment: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO conformance_inbox(source,message_id,payload_sha256,message_type,assignment_id,assignment_generation,processed_at,outcome) VALUES($1,$2,$3,$4,$5,$6,now(),'{"disposition":"applied"}')`, source, messageID, hash, messageType, assignment.ID, assignment.Generation); err != nil {
 		return ApplyResult{}, fmt.Errorf("record inbox: %w", err)
 	}
+	eventPayload, err := json.Marshal(struct {
+		EventType  string                     `json:"event_type"`
+		Lifecycle  domain.AssignmentLifecycle `json:"lifecycle"`
+		Assignment domain.Assignment          `json:"assignment"`
+	}{EventType: "assignment_received", Lifecycle: domain.AssignmentReceived, Assignment: assignment})
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("encode preparation result: %w", err)
+	}
+	transitionID := stableID("assignment-transition", source, messageID, fmt.Sprint(assignment.Generation), string(domain.AssignmentReceived))
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_assignment_transitions(transition_id,source,message_id,assignment_id,assignment_generation,to_state,payload) VALUES($1,$2,$3,$4,$5,'candidate_received',$6)`, transitionID, source, messageID, assignment.ID, assignment.Generation, eventPayload); err != nil {
+		return ApplyResult{}, fmt.Errorf("record preparation transition: %w", err)
+	}
+	if replacedErr == nil {
+		replacedTransitionID := stableID("assignment-transition", source, messageID, fmt.Sprint(replacedGeneration), string(domain.AssignmentSuperseded))
+		if _, err = tx.Exec(ctx, `INSERT INTO conformance_assignment_transitions(transition_id,source,message_id,assignment_id,assignment_generation,from_state,to_state,payload) VALUES($1,$2,$3,$4,$5,$6,'superseded',$7)`, replacedTransitionID, source, messageID, assignment.ID, replacedGeneration, replacedState, eventPayload); err != nil {
+			return ApplyResult{}, fmt.Errorf("record replaced candidate transition: %w", err)
+		}
+	}
 	receiptID := stableID("assignment-received", source, messageID)
-	if _, err = tx.Exec(ctx, `INSERT INTO conformance_outbox(outbox_id,destination,idempotency_key,assignment_id,assignment_generation,evaluation_revision,payload) VALUES($1,'api',$1,$2,$3,0,$4)`, receiptID, assignment.ID, assignment.Generation, payload); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_outbox(outbox_id,destination,idempotency_key,assignment_id,assignment_generation,evaluation_revision,payload) VALUES($1,'api',$1,$2,$3,0,$4)`, receiptID, assignment.ID, assignment.Generation, eventPayload); err != nil {
 		return ApplyResult{}, fmt.Errorf("enqueue receipt: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return ApplyResult{}, fmt.Errorf("commit assignment: %w", err)
 	}
 	return ApplyResult{Disposition: ApplyApplied, Assignment: assignment}, nil
+}
+
+// ApplyAssignment is retained for the initial internal callers. Its semantics
+// are preparation-only; it never supersedes the current authority.
+func (s *Store) ApplyAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
+	return s.PrepareAssignment(ctx, source, messageID, messageType, assignment)
+}
+
+type LifecycleResult struct {
+	Disposition ApplyDisposition
+	Record      domain.AssignmentRecord
+}
+
+type lifecycleCommand struct {
+	AssignmentID string     `json:"assignment_id"`
+	Generation   uint64     `json:"assignment_generation"`
+	EffectiveAt  *time.Time `json:"effective_at,omitempty"`
+}
+
+// ArmAssignment marks a prepared generation ready for cutover. It does not
+// grant authority and does not make the generation claimable by evaluators.
+func (s *Store) ArmAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64) (LifecycleResult, error) {
+	return s.transitionCandidate(ctx, source, messageID, "assignment_armed", assignmentID, generation, domain.AssignmentArmed)
+}
+
+// CancelCandidate discards a received or armed replacement without disturbing
+// the active generation.
+func (s *Store) CancelCandidate(ctx context.Context, source, messageID, assignmentID string, generation uint64) (LifecycleResult, error) {
+	return s.transitionCandidate(ctx, source, messageID, "assignment_cancelled", assignmentID, generation, domain.AssignmentCancelled)
+}
+
+func (s *Store) transitionCandidate(ctx context.Context, source, messageID, messageType, assignmentID string, generation uint64, target domain.AssignmentLifecycle) (LifecycleResult, error) {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(assignmentID) == "" || generation == 0 || generation > math.MaxInt64 {
+		return LifecycleResult{}, fmt.Errorf("assignment lifecycle command is invalid")
+	}
+	command := lifecycleCommand{AssignmentID: assignmentID, Generation: generation}
+	payload, hash, err := encodeCommand(messageType, command)
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, assignmentID); err != nil {
+		return LifecycleResult{}, err
+	}
+	if existing, found, err := readInboxHash(ctx, tx, source, messageID); err != nil {
+		return LifecycleResult{}, err
+	} else if found {
+		if existing != hash {
+			return LifecycleResult{}, ErrMessageConflict
+		}
+		record, err := readAssignmentRecord(ctx, tx, assignmentID, generation)
+		if err != nil {
+			return LifecycleResult{}, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return LifecycleResult{}, err
+		}
+		return LifecycleResult{Disposition: ApplyIdempotent, Record: record}, nil
+	}
+
+	record, err := readAssignmentRecord(ctx, tx, assignmentID, generation)
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	var latest uint64
+	if err = tx.QueryRow(ctx, `SELECT max(assignment_generation) FROM conformance_assignments WHERE assignment_id=$1`, assignmentID).Scan(&latest); err != nil {
+		return LifecycleResult{}, err
+	}
+	if generation != latest {
+		return LifecycleResult{}, ErrStaleAssignment
+	}
+	from := record.Lifecycle
+	valid := (target == domain.AssignmentArmed && from == domain.AssignmentReceived) || (target == domain.AssignmentCancelled && (from == domain.AssignmentReceived || from == domain.AssignmentArmed))
+	if !valid {
+		return LifecycleResult{}, fmt.Errorf("%w: %s to %s", ErrInvalidTransition, from, target)
+	}
+	if target == domain.AssignmentArmed {
+		_, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='candidate_armed',armed_at=now(),updated_at=now() WHERE assignment_id=$1 AND assignment_generation=$2 AND lifecycle_state='candidate_received'`, assignmentID, generation)
+	} else {
+		_, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='cancelled',lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$1 AND assignment_generation=$2 AND lifecycle_state IN ('candidate_received','candidate_armed')`, assignmentID, generation)
+	}
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	if err = recordLifecycleCommand(ctx, tx, source, messageID, messageType, assignmentID, generation, string(from), string(target), nil, payload, hash); err != nil {
+		return LifecycleResult{}, err
+	}
+	record, err = readAssignmentRecord(ctx, tx, assignmentID, generation)
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return LifecycleResult{}, err
+	}
+	return LifecycleResult{Disposition: ApplyApplied, Record: record}, nil
+}
+
+// CutoverAssignment atomically closes the current generation's authority
+// interval and activates an armed candidate at effectiveAt. effectiveAt is an
+// event-time boundary; late observations before it continue to resolve to the
+// superseded generation.
+func (s *Store) CutoverAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64, effectiveAt time.Time) (LifecycleResult, error) {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(assignmentID) == "" || generation == 0 || generation > math.MaxInt64 || effectiveAt.IsZero() {
+		return LifecycleResult{}, fmt.Errorf("assignment cutover command is invalid")
+	}
+	effectiveAt = effectiveAt.UTC()
+	effectiveUnixNS := effectiveAt.UnixNano()
+	if effectiveAt.Year() < 1678 || effectiveAt.Year() > 2261 {
+		return LifecycleResult{}, fmt.Errorf("assignment cutover is outside the supported nanosecond timestamp range")
+	}
+	command := lifecycleCommand{AssignmentID: assignmentID, Generation: generation, EffectiveAt: &effectiveAt}
+	payload, hash, err := encodeCommand("assignment_cutover", command)
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, assignmentID); err != nil {
+		return LifecycleResult{}, err
+	}
+	if existing, found, err := readInboxHash(ctx, tx, source, messageID); err != nil {
+		return LifecycleResult{}, err
+	} else if found {
+		if existing != hash {
+			return LifecycleResult{}, ErrMessageConflict
+		}
+		record, err := readAssignmentRecord(ctx, tx, assignmentID, generation)
+		if err != nil {
+			return LifecycleResult{}, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return LifecycleResult{}, err
+		}
+		return LifecycleResult{Disposition: ApplyIdempotent, Record: record}, nil
+	}
+	var databaseNow time.Time
+	if err = tx.QueryRow(ctx, `SELECT now()`).Scan(&databaseNow); err != nil {
+		return LifecycleResult{}, err
+	}
+	if effectiveAt.After(databaseNow) {
+		return LifecycleResult{}, fmt.Errorf("%w: future cutovers must be delivered when authoritative", ErrInvalidTransition)
+	}
+	candidate, err := readAssignmentRecord(ctx, tx, assignmentID, generation)
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	if candidate.Lifecycle != domain.AssignmentArmed {
+		return LifecycleResult{}, fmt.Errorf("%w: %s is not armed", ErrInvalidTransition, candidate.Lifecycle)
+	}
+	if effectiveAt.Before(candidate.Assignment.EffectiveFrom) || !effectiveAt.Before(candidate.Assignment.EffectiveUntil) {
+		return LifecycleResult{}, fmt.Errorf("%w: cutover is outside candidate effective window", ErrInvalidTransition)
+	}
+	var currentGeneration uint64
+	var currentAuthorityFromUnixNS int64
+	var currentLifecycle string
+	err = tx.QueryRow(ctx, `SELECT assignment_generation,authority_from_unix_ns,lifecycle_state FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('active','ending') FOR UPDATE`, assignmentID).Scan(&currentGeneration, &currentAuthorityFromUnixNS, &currentLifecycle)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return LifecycleResult{}, err
+	}
+	if err == nil {
+		if currentGeneration >= generation || effectiveUnixNS <= currentAuthorityFromUnixNS {
+			return LifecycleResult{}, ErrStaleAssignment
+		}
+		if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='superseded',authority_until=$1,authority_until_unix_ns=$2,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$3 AND assignment_generation=$4 AND lifecycle_state IN ('active','ending')`, effectiveAt, effectiveUnixNS, assignmentID, currentGeneration); err != nil {
+			return LifecycleResult{}, err
+		}
+	}
+	if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='active',authority_from=$1,authority_from_unix_ns=$2,authority_until=NULL,authority_until_unix_ns=NULL,cutover_at=$1,next_evaluation_at=now(),lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$3 AND assignment_generation=$4 AND lifecycle_state='candidate_armed'`, effectiveAt, effectiveUnixNS, assignmentID, generation); err != nil {
+		return LifecycleResult{}, err
+	}
+	if err = recordLifecycleCommand(ctx, tx, source, messageID, "assignment_cutover", assignmentID, generation, string(domain.AssignmentArmed), string(domain.AssignmentActive), &effectiveAt, payload, hash); err != nil {
+		return LifecycleResult{}, err
+	}
+	if currentGeneration != 0 {
+		oldTransitionID := stableID("assignment-transition", source, messageID, fmt.Sprint(currentGeneration), string(domain.AssignmentSuperseded))
+		if _, err = tx.Exec(ctx, `INSERT INTO conformance_assignment_transitions(transition_id,source,message_id,assignment_id,assignment_generation,from_state,to_state,effective_at,payload) VALUES($1,$2,$3,$4,$5,$6,'superseded',$7,$8)`, oldTransitionID, source, messageID, assignmentID, currentGeneration, currentLifecycle, effectiveAt, payload); err != nil {
+			return LifecycleResult{}, fmt.Errorf("record superseded current transition: %w", err)
+		}
+	}
+	candidate, err = readAssignmentRecord(ctx, tx, assignmentID, generation)
+	if err != nil {
+		return LifecycleResult{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return LifecycleResult{}, err
+	}
+	return LifecycleResult{Disposition: ApplyApplied, Record: candidate}, nil
+}
+
+// ResolveAssignmentAt returns the immutable generation authoritative for an
+// observation timestamp. Historical superseded generations remain resolvable.
+func (s *Store) ResolveAssignmentAt(ctx context.Context, assignmentID string, observedAt time.Time) (domain.AssignmentRecord, bool, error) {
+	if observedAt.Year() < 1678 || observedAt.Year() > 2261 {
+		return domain.AssignmentRecord{}, false, fmt.Errorf("observation is outside the supported nanosecond timestamp range")
+	}
+	observedUnixNS := observedAt.UnixNano()
+	row := s.pool.QueryRow(ctx, `SELECT specification,lifecycle_state,authority_from_unix_ns,authority_until_unix_ns,prepared_at,armed_at,cutover_at FROM conformance_assignments WHERE assignment_id=$1 AND authority_from_unix_ns<=$2 AND (authority_until_unix_ns IS NULL OR $2<authority_until_unix_ns) ORDER BY authority_from_unix_ns DESC LIMIT 1`, assignmentID, observedUnixNS)
+	record, err := scanAssignmentRecord(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AssignmentRecord{}, false, nil
+	}
+	if err != nil {
+		return domain.AssignmentRecord{}, false, fmt.Errorf("resolve assignment at observation: %w", err)
+	}
+	return record, true, nil
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanAssignmentRecord(row rowScanner) (domain.AssignmentRecord, error) {
+	var record domain.AssignmentRecord
+	var raw []byte
+	var authorityFromUnixNS, authorityUntilUnixNS *int64
+	if err := row.Scan(&raw, &record.Lifecycle, &authorityFromUnixNS, &authorityUntilUnixNS, &record.PreparedAt, &record.ArmedAt, &record.CutoverAt); err != nil {
+		return domain.AssignmentRecord{}, err
+	}
+	if authorityFromUnixNS != nil {
+		value := time.Unix(0, *authorityFromUnixNS).UTC()
+		record.AuthorityFrom = &value
+	}
+	if authorityUntilUnixNS != nil {
+		value := time.Unix(0, *authorityUntilUnixNS).UTC()
+		record.AuthorityUntil = &value
+	}
+	if err := json.Unmarshal(raw, &record.Assignment); err != nil {
+		return domain.AssignmentRecord{}, fmt.Errorf("decode assignment record: %w", err)
+	}
+	return record, nil
+}
+
+func readAssignmentRecord(ctx context.Context, tx pgx.Tx, assignmentID string, generation uint64) (domain.AssignmentRecord, error) {
+	record, err := scanAssignmentRecord(tx.QueryRow(ctx, `SELECT specification,lifecycle_state,authority_from_unix_ns,authority_until_unix_ns,prepared_at,armed_at,cutover_at FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2 FOR UPDATE`, assignmentID, generation))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AssignmentRecord{}, fmt.Errorf("assignment %s generation %d: %w", assignmentID, generation, ErrInvalidTransition)
+	}
+	return record, err
+}
+
+func readInboxHash(ctx context.Context, tx pgx.Tx, source, messageID string) (string, bool, error) {
+	var hash string
+	err := tx.QueryRow(ctx, `SELECT payload_sha256 FROM conformance_inbox WHERE source=$1 AND message_id=$2 FOR UPDATE`, source, messageID).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read lifecycle inbox: %w", err)
+	}
+	return hash, true, nil
+}
+
+func encodeCommand(messageType string, command lifecycleCommand) ([]byte, string, error) {
+	payload, err := json.Marshal(command)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode lifecycle command: %w", err)
+	}
+	envelope, err := json.Marshal(struct {
+		MessageType string          `json:"message_type"`
+		Command     json.RawMessage `json:"command"`
+	}{MessageType: messageType, Command: payload})
+	if err != nil {
+		return nil, "", fmt.Errorf("encode lifecycle envelope: %w", err)
+	}
+	hashBytes := sha256.Sum256(envelope)
+	return envelope, hex.EncodeToString(hashBytes[:]), nil
+}
+
+func recordLifecycleCommand(ctx context.Context, tx pgx.Tx, source, messageID, messageType, assignmentID string, generation uint64, from, to string, effectiveAt *time.Time, payload []byte, hash string) error {
+	outcome, err := json.Marshal(map[string]string{"disposition": "applied", "lifecycle": to})
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_inbox(source,message_id,payload_sha256,message_type,assignment_id,assignment_generation,processed_at,outcome) VALUES($1,$2,$3,$4,$5,$6,now(),$7)`, source, messageID, hash, messageType, assignmentID, generation, outcome); err != nil {
+		return fmt.Errorf("record lifecycle inbox: %w", err)
+	}
+	transitionID := stableID("assignment-transition", source, messageID, fmt.Sprint(generation), to)
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_assignment_transitions(transition_id,source,message_id,assignment_id,assignment_generation,from_state,to_state,effective_at,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, transitionID, source, messageID, assignmentID, generation, from, to, effectiveAt, payload); err != nil {
+		return fmt.Errorf("record lifecycle transition: %w", err)
+	}
+	outboxID := stableID("assignment-lifecycle", source, messageID)
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_outbox(outbox_id,destination,idempotency_key,assignment_id,assignment_generation,evaluation_revision,payload) VALUES($1,'api',$1,$2,$3,0,$4)`, outboxID, assignmentID, generation, payload); err != nil {
+		return fmt.Errorf("enqueue lifecycle result: %w", err)
+	}
+	return nil
 }
 
 type Claim struct {
@@ -171,7 +504,7 @@ func (s *Store) ClaimDueAssignments(ctx context.Context, workerID string, lease 
 	}
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 SELECT assignment_id,assignment_generation FROM conformance_assignments
-WHERE lifecycle_state IN ('received','armed','active','ending') AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
+WHERE lifecycle_state IN ('active','ending') AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
 ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
@@ -202,7 +535,7 @@ func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND lifecycle_state IN ('received','armed','active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration)
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration)
 	if err != nil {
 		return fmt.Errorf("renew assignment lease: %w", err)
 	}
@@ -253,9 +586,9 @@ func (s *Store) CommitEvaluation(ctx context.Context, claim Claim, commit Evalua
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var revision uint64
-	err = tx.QueryRow(ctx, `UPDATE conformance_assignments SET evaluation_revision=evaluation_revision+1,next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND lifecycle_state IN ('received','armed','active','ending') RETURNING evaluation_revision`, commit.NextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision).Scan(&revision)
+	err = tx.QueryRow(ctx, `UPDATE conformance_assignments SET evaluation_revision=evaluation_revision+1,next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND lifecycle_state IN ('active','ending') RETURNING evaluation_revision`, commit.NextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision).Scan(&revision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrLeaseLost
 	}

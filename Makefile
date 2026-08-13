@@ -19,7 +19,7 @@ test-race:
 	go test -race ./...
 
 integration:
-	go test -tags=integration -timeout=10m -v ./internal/integration
+	go test -tags=integration -timeout=10m -v ./internal/integration ./internal/store/postgres
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './vendor/*')

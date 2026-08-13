@@ -17,6 +17,13 @@ boundaries unless an accepted design change explicitly moves them:
 
 - Assignment generation, worker lease generation, and evaluation revision are
   different fences. Do not collapse them.
+- A received or armed candidate never authorizes telemetry and is never
+  claimable. Only an explicit cutover can activate it.
+- At an assignment cutover, old authority is `[old_from, cutover)` and new
+  authority is `[cutover, new_until)`. Never union candidate and current
+  geometry, and resolve delayed observations by event time.
+- Preparing or cancelling a candidate must not change the current generation;
+  cutover must atomically fence every lease held by the superseded generation.
 - Claim and renewal use PostgreSQL time. An expired lease must never be revived.
 - Summary, incidents, transition events, checkpoint, and delivery outbox commit
   atomically behind the current assignment lease.
