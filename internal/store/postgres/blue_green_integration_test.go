@@ -84,7 +84,20 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("old claim=%#v err=%v", claims, err)
 	}
-	initialEvaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: now.Add(-time.Second), FrameID: "initial-frame", WALID: "initial-wal", WALSequence: 1}
+	initialEvaluation := domain.Evaluation{
+		Condition:  domain.ConditionConforming,
+		Monitoring: domain.MonitoringCurrent,
+		Recording:  domain.RecordingPending,
+		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
+		Transitions: []domain.IncidentTransition{
+			{Violation: domain.ViolationLateral, Transition: domain.TransitionOpened, ObservedAt: now.Add(-2 * time.Second), FrameID: "incident-open"},
+			{Violation: domain.ViolationLateral, Transition: domain.TransitionResolved, ObservedAt: now.Add(-time.Second), FrameID: "incident-resolved"},
+		},
+		ObservedAt:  now.Add(-time.Second),
+		FrameID:     "initial-frame",
+		WALID:       "initial-wal",
+		WALSequence: 1,
+	}
 	if err = first.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: initialEvaluation, NextEvaluationAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +163,10 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 		t.Fatalf("replacement claim=%#v err=%v", claims, err)
 	}
 	currentClaim := claims[0]
-	historical := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: cutover.Add(-time.Nanosecond), FrameID: "historical-frame", WALID: "historical-wal", WALSequence: 9}
+	// Replay the exact suffix that already opened and resolved an incident. The
+	// historical commit must reuse the immutable incident occurrence and events
+	// instead of failing on the resolved incident's primary key.
+	historical := initialEvaluation
 	historicalCommit := postgresstore.EvaluationCommit{Evaluation: historical, NextEvaluationAt: time.Now().UTC()}
 	if err = second.CommitHistoricalEvaluation(ctx, currentClaim, base.Generation, historicalCommit); err != nil {
 		t.Fatalf("historical reconciliation commit: %v", err)
@@ -190,7 +206,8 @@ func assertHistoricalPersistence(t *testing.T, ctx context.Context, dsn, assignm
 		t.Fatal(err)
 	}
 	defer conn.Close(ctx)
-	var historicalRevision, currentRevision, checkpoints, summaries, registryOutbox int
+	var historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, incidents, events int
+	var incidentState string
 	var observedAt time.Time
 	if err = conn.QueryRow(ctx, `SELECT
   (SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2),
@@ -198,11 +215,14 @@ func assertHistoricalPersistence(t *testing.T, ctx context.Context, dsn, assignm
   (SELECT count(*) FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2),
   (SELECT count(*) FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
   (SELECT count(*) FROM conformance_outbox WHERE assignment_id=$1 AND assignment_generation=$2 AND destination='registry'),
-  (SELECT observed_at FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, historicalGeneration, currentGeneration).Scan(&historicalRevision, &currentRevision, &checkpoints, &summaries, &registryOutbox, &observedAt); err != nil {
+	(SELECT observed_at FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT state FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, historicalGeneration, currentGeneration).Scan(&historicalRevision, &currentRevision, &checkpoints, &summaries, &registryOutbox, &observedAt, &incidents, &events, &incidentState); err != nil {
 		t.Fatal(err)
 	}
-	if historicalRevision != 2 || currentRevision != 0 || checkpoints != 2 || summaries != 1 || registryOutbox != 1 || observedAt.Sub(evaluation.ObservedAt).Abs() >= time.Microsecond {
-		t.Fatalf("historical persistence revision=%d current_revision=%d checkpoints=%d summaries=%d registry_outbox=%d observed_at=%s", historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, observedAt)
+	if historicalRevision != 2 || currentRevision != 0 || checkpoints != 2 || summaries != 1 || registryOutbox != 1 || incidents != 1 || events != 2 || incidentState != "resolved" || observedAt.Sub(evaluation.ObservedAt).Abs() >= time.Microsecond {
+		t.Fatalf("historical persistence revision=%d current_revision=%d checkpoints=%d summaries=%d registry_outbox=%d incidents=%d events=%d incident_state=%s observed_at=%s", historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, incidents, events, incidentState, observedAt)
 	}
 }
 

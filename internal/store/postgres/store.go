@@ -689,11 +689,27 @@ func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignmen
 		eventID := stableID("event", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, string(transition.Transition), transition.FrameID)
 		if transition.Transition == domain.TransitionOpened {
 			incidentID = stableID("incident", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, transition.FrameID)
-			err = tx.QueryRow(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$5,$6) ON CONFLICT (assignment_id,assignment_generation,incident_key) WHERE state='open' DO UPDATE SET last_observed_at=EXCLUDED.last_observed_at,revision=conformance_incidents.revision+1,details=EXCLUDED.details RETURNING incident_id`, incidentID, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt, payload).Scan(&incidentID)
+			err = tx.QueryRow(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$5,$6)
+ON CONFLICT (incident_id) DO UPDATE SET incident_id=EXCLUDED.incident_id
+WHERE conformance_incidents.assignment_id=EXCLUDED.assignment_id
+  AND conformance_incidents.assignment_generation=EXCLUDED.assignment_generation
+  AND conformance_incidents.incident_key=EXCLUDED.incident_key
+  AND conformance_incidents.violation_type=EXCLUDED.violation_type
+  AND conformance_incidents.opened_at=EXCLUDED.opened_at
+RETURNING incident_id`, incidentID, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt, payload).Scan(&incidentID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("incident %s conflicts with immutable opening evidence: %w", incidentID, ErrMessageConflict)
+			}
 		} else if transition.Transition == domain.TransitionResolved {
 			err = tx.QueryRow(ctx, `UPDATE conformance_incidents SET state='resolved',resolved_at=$1,last_observed_at=$1,revision=revision+1,details=$2 WHERE assignment_id=$3 AND assignment_generation=$4 AND incident_key=$5 AND state='open' RETURNING incident_id`, transition.ObservedAt, payload, assignment.ID, assignment.Generation, incidentKey).Scan(&incidentID)
 			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("resolve %s incident: open incident not found", incidentKey)
+				// Deterministic suffix replay may encounter the same resolution
+				// after the incident is already resolved. Reuse only the exact
+				// immutable resolution occurrence; never resolve another episode.
+				err = tx.QueryRow(ctx, `SELECT incident_id FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2 AND incident_key=$3 AND state='resolved' AND resolved_at=$4 ORDER BY opened_at DESC LIMIT 1 FOR UPDATE`, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt).Scan(&incidentID)
+				if errors.Is(err, pgx.ErrNoRows) {
+					return fmt.Errorf("resolve %s incident: matching incident not found", incidentKey)
+				}
 			}
 		}
 		if err != nil {
