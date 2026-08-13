@@ -67,9 +67,10 @@ func TestEvaluateBatchTransitionsKeepOccurrenceAndOwnWALCursor(t *testing.T) {
 		if transition.Violation != domain.ViolationLateral {
 			continue
 		}
-		if transition.Transition == domain.TransitionOpened {
+		switch transition.Transition {
+		case domain.TransitionOpened:
 			opening = transition
-		} else if transition.Transition == domain.TransitionResolved {
+		case domain.TransitionResolved:
 			resolution = transition
 		}
 	}
