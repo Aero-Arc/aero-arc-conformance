@@ -23,7 +23,11 @@ UPDATE conformance_assignments
 SET authority_from = (specification->>'effective_from')::timestamptz,
     authority_from_unix_ns =
       extract(epoch FROM date_trunc('second', (specification->>'effective_from')::timestamptz))::bigint * 1000000000
-      + coalesce(rpad((regexp_match(specification->>'effective_from', E'\\.([0-9]+)'))[1], 9, '0')::bigint, 0)
+      + coalesce(rpad((regexp_match(specification->>'effective_from', E'\\.([0-9]+)'))[1], 9, '0')::bigint, 0),
+    authority_until = (specification->>'effective_until')::timestamptz,
+    authority_until_unix_ns =
+      extract(epoch FROM date_trunc('second', (specification->>'effective_until')::timestamptz))::bigint * 1000000000
+      + coalesce(rpad((regexp_match(specification->>'effective_until', E'\\.([0-9]+)'))[1], 9, '0')::bigint, 0)
 WHERE lifecycle_state IN ('active','ending');
 
 ALTER TABLE conformance_assignments
@@ -41,7 +45,7 @@ ALTER TABLE conformance_assignments
   ADD CONSTRAINT conformance_lifecycle_authority_valid
   CHECK (
     (lifecycle_state IN ('candidate_received','candidate_armed','cancelled') AND authority_from_unix_ns IS NULL AND authority_until_unix_ns IS NULL)
-    OR (lifecycle_state IN ('active','ending') AND authority_from_unix_ns IS NOT NULL AND authority_until_unix_ns IS NULL)
+    OR (lifecycle_state IN ('active','ending') AND authority_from_unix_ns IS NOT NULL AND authority_until_unix_ns IS NOT NULL)
     OR (lifecycle_state = 'superseded' AND ((authority_from_unix_ns IS NULL AND authority_until_unix_ns IS NULL) OR (authority_from_unix_ns IS NOT NULL AND authority_until_unix_ns IS NOT NULL)))
     OR lifecycle_state = 'completed'
   );

@@ -56,8 +56,11 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 	}
 	defer second.Close()
 	resolvedUpgrade, found, err := first.ResolveAssignmentAt(ctx, upgraded.ID, upgraded.EffectiveFrom)
-	if err != nil || !found || resolvedUpgrade.Assignment.Generation != upgraded.Generation || resolvedUpgrade.AuthorityFrom == nil || !resolvedUpgrade.AuthorityFrom.Equal(upgraded.EffectiveFrom) {
+	if err != nil || !found || resolvedUpgrade.Assignment.Generation != upgraded.Generation || resolvedUpgrade.AuthorityFrom == nil || !resolvedUpgrade.AuthorityFrom.Equal(upgraded.EffectiveFrom) || resolvedUpgrade.AuthorityUntil == nil || !resolvedUpgrade.AuthorityUntil.Equal(upgraded.EffectiveUntil) {
 		t.Fatalf("v1 active assignment was not upgraded exactly: %#v found=%v err=%v", resolvedUpgrade, found, err)
+	}
+	if _, found, err = first.ResolveAssignmentAt(ctx, upgraded.ID, upgraded.EffectiveUntil); err != nil || found {
+		t.Fatalf("v1 authority remained open at its exclusive end: found=%v err=%v", found, err)
 	}
 
 	terminal := assignment(now, 1, 1)
@@ -80,6 +83,14 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 	claims, err := first.ClaimDueAssignments(ctx, "old-worker", time.Minute, 10)
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("old claim=%#v err=%v", claims, err)
+	}
+	initialEvaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: now.Add(-time.Second), FrameID: "initial-frame", WALID: "initial-wal", WALSequence: 1}
+	if err = first.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: initialEvaluation, NextEvaluationAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err = first.ClaimDueAssignments(ctx, "old-worker-reclaimed", time.Minute, 10)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("reclaimed old assignment=%#v err=%v", claims, err)
 	}
 	oldClaim := claims[0]
 
@@ -125,8 +136,11 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 		t.Fatalf("before=%#v found=%v err=%v", before, found, err)
 	}
 	after, found, err := second.ResolveAssignmentAt(ctx, base.ID, cutover)
-	if err != nil || !found || after.Assignment.Generation != 3 {
+	if err != nil || !found || after.Assignment.Generation != 3 || after.AuthorityUntil == nil || !after.AuthorityUntil.Equal(candidate.EffectiveUntil) {
 		t.Fatalf("after=%#v found=%v err=%v", after, found, err)
+	}
+	if _, found, err = second.ResolveAssignmentAt(ctx, base.ID, candidate.EffectiveUntil); err != nil || found {
+		t.Fatalf("replacement authority remained open at its exclusive end: found=%v err=%v", found, err)
 	}
 	if err = first.RenewAssignmentLease(ctx, oldClaim, time.Minute); !errors.Is(err, postgresstore.ErrLeaseLost) {
 		t.Fatalf("superseded lease renewed: %v", err)
@@ -134,6 +148,61 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 	claims, err = second.ClaimDueAssignments(ctx, "new-worker", time.Minute, 10)
 	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != 3 {
 		t.Fatalf("replacement claim=%#v err=%v", claims, err)
+	}
+	currentClaim := claims[0]
+	historical := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: cutover.Add(-time.Nanosecond), FrameID: "historical-frame", WALID: "historical-wal", WALSequence: 9}
+	historicalCommit := postgresstore.EvaluationCommit{Evaluation: historical, NextEvaluationAt: time.Now().UTC()}
+	if err = second.CommitHistoricalEvaluation(ctx, currentClaim, base.Generation, historicalCommit); err != nil {
+		t.Fatalf("historical reconciliation commit: %v", err)
+	}
+	if err = second.CommitHistoricalEvaluation(ctx, currentClaim, base.Generation, historicalCommit); !errors.Is(err, postgresstore.ErrLeaseLost) {
+		t.Fatalf("consumed current fence was reusable: %v", err)
+	}
+	assertHistoricalPersistence(t, ctx, dsn, base.ID, base.Generation, candidate.Generation, historical)
+	claims, err = second.ClaimDueAssignments(ctx, "invalid-history-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != candidate.Generation {
+		t.Fatalf("invalid-history claim=%#v err=%v", claims, err)
+	}
+	invalidHistorical := historicalCommit
+	invalidHistorical.Evaluation.ObservedAt = cutover
+	invalidHistorical.Evaluation.FrameID = "wrong-interval-frame"
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidHistorical); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("out-of-interval historical evaluation: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid history attempt consumed the current fence: %v", err)
+	}
+	afterAuthority := historicalCommit
+	afterAuthority.Evaluation.ObservedAt = candidate.EffectiveUntil
+	afterAuthority.Evaluation.FrameID = "after-authority-frame"
+	if err = second.CommitEvaluation(ctx, claims[0], afterAuthority); !errors.Is(err, postgresstore.ErrLeaseLost) {
+		t.Fatalf("live commit crossed exclusive authority end: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("rejected post-authority commit consumed the lease: %v", err)
+	}
+}
+
+func assertHistoricalPersistence(t *testing.T, ctx context.Context, dsn, assignmentID string, historicalGeneration, currentGeneration uint64, evaluation domain.Evaluation) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var historicalRevision, currentRevision, checkpoints, summaries, registryOutbox int
+	var observedAt time.Time
+	if err = conn.QueryRow(ctx, `SELECT
+  (SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2),
+  (SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$3),
+  (SELECT count(*) FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2),
+  (SELECT count(*) FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
+  (SELECT count(*) FROM conformance_outbox WHERE assignment_id=$1 AND assignment_generation=$2 AND destination='registry'),
+  (SELECT observed_at FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, historicalGeneration, currentGeneration).Scan(&historicalRevision, &currentRevision, &checkpoints, &summaries, &registryOutbox, &observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if historicalRevision != 2 || currentRevision != 0 || checkpoints != 2 || summaries != 1 || registryOutbox != 1 || observedAt.Sub(evaluation.ObservedAt).Abs() >= time.Microsecond {
+		t.Fatalf("historical persistence revision=%d current_revision=%d checkpoints=%d summaries=%d registry_outbox=%d observed_at=%s", historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, observedAt)
 	}
 }
 

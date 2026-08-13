@@ -42,7 +42,17 @@ generation 8: [cutover, authority_until_8)
 `ResolveAssignmentAt` selects the immutable generation for an observation's
 capture time. A delayed frame received after cutover but captured before it is
 therefore evaluated against generation 7. A frame captured exactly at cutover
-belongs to generation 8.
+belongs to generation 8. The replacement interval ends exclusively at its
+immutable `effective_until`; observations at or after that boundary have no
+assignment authority.
+
+Late evaluation does not revive a generation 7 lease. A worker holding the
+current generation 8 lease may call `CommitHistoricalEvaluation`; PostgreSQL
+atomically consumes that current lease, verifies the observation belongs to the
+stored generation 7 authority interval, and commits generation 7 evidence. The
+historical summary and checkpoint remain generation-scoped and no Registry live
+projection is emitted, so reconciliation cannot roll generation 8 live state
+backward.
 
 PostgreSQL `timestamptz` is retained for readable audit timestamps, but it has
 microsecond precision. Authority comparisons use companion signed Unix-
@@ -60,6 +70,9 @@ cannot be rounded onto the wrong generation.
   content is a conflict.
 - Cutover clears the previous generation's lease. Its paused worker cannot
   renew or commit because both lifecycle and lease fences fail.
+- A delayed pre-cutover observation can be reconciled only through a valid
+  current-generation lease; an out-of-interval attempt rolls back without
+  consuming that lease.
 - Lower assignment generations are recorded as stale and cannot resurrect.
 - The transition history and API outbox are written in the same transaction as
   every lifecycle change.

@@ -154,6 +154,10 @@ authority interval and cannot be claimed. Authority intervals are half-open, so
 an observation exactly at cutover belongs only to the replacement. A cancelled
 candidate never affects the current assignment. A newer candidate may supersede
 an older candidate, but preparation alone never supersedes current authority.
+Every current interval ends at the immutable assignment `effective_until`.
+Delayed observations for a superseded interval are committed as historical
+reconciliation behind the current generation's lease; they update only the
+historical generation and never enqueue a current Registry projection.
 
 ## Worker death and reclaim
 

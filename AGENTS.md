@@ -24,6 +24,9 @@ boundaries unless an accepted design change explicitly moves them:
   geometry, and resolve delayed observations by event time.
 - Preparing or cancelling a candidate must not change the current generation;
   cutover must atomically fence every lease held by the superseded generation.
+- Historical reconciliation must be fenced by the current generation's lease,
+  remain scoped to the superseded authority interval, and never publish a live
+  Registry projection or revive a superseded lease.
 - Claim and renewal use PostgreSQL time. An expired lease must never be revived.
 - Summary, incidents, transition events, checkpoint, and delivery outbox commit
   atomically behind the current assignment lease.

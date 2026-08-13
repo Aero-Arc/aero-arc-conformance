@@ -298,10 +298,10 @@ func testBlueGreenCutover(t *testing.T, ctx context.Context, store *postgresstor
 	if err != nil || !found || current.Assignment.Generation != 3 {
 		t.Fatalf("failed future cutover disturbed authority: %#v found=%v err=%v", current, found, err)
 	}
-	assertBlueGreenPersistence(t, ctx, postgresURL, base.ID, cutover)
+	assertBlueGreenPersistence(t, ctx, postgresURL, base.ID, cutover, replacement.EffectiveUntil)
 }
 
-func assertBlueGreenPersistence(t *testing.T, ctx context.Context, url, assignmentID string, cutover time.Time) {
+func assertBlueGreenPersistence(t *testing.T, ctx context.Context, url, assignmentID string, cutover, replacementEnd time.Time) {
 	t.Helper()
 	conn, err := pgx.Connect(ctx, url)
 	if err != nil {
@@ -309,18 +309,19 @@ func assertBlueGreenPersistence(t *testing.T, ctx context.Context, url, assignme
 	}
 	defer conn.Close(ctx)
 	var currentCount, candidateCount, oldSupersededTransitions int
-	var oldUntilUnixNS, newFromUnixNS int64
+	var oldUntilUnixNS, newFromUnixNS, newUntilUnixNS int64
 	err = conn.QueryRow(ctx, `SELECT
   (SELECT count(*) FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('active','ending')),
 	  (SELECT count(*) FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('candidate_received','candidate_armed')),
 	  (SELECT authority_until_unix_ns FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=1),
 	  (SELECT authority_from_unix_ns FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=3),
-	  (SELECT count(*) FROM conformance_assignment_transitions WHERE assignment_id=$1 AND assignment_generation=1 AND from_state='active' AND to_state='superseded' AND effective_at=$2)`, assignmentID, cutover).Scan(&currentCount, &candidateCount, &oldUntilUnixNS, &newFromUnixNS, &oldSupersededTransitions)
+	  (SELECT authority_until_unix_ns FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=3),
+	  (SELECT count(*) FROM conformance_assignment_transitions WHERE assignment_id=$1 AND assignment_generation=1 AND from_state='active' AND to_state='superseded' AND effective_at=$2)`, assignmentID, cutover).Scan(&currentCount, &candidateCount, &oldUntilUnixNS, &newFromUnixNS, &newUntilUnixNS, &oldSupersededTransitions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if currentCount != 1 || candidateCount != 0 || oldUntilUnixNS != cutover.UnixNano() || newFromUnixNS != cutover.UnixNano() || oldSupersededTransitions != 1 {
-		t.Fatalf("blue-green persistence current=%d candidate=%d old_until_ns=%d new_from_ns=%d old_transitions=%d", currentCount, candidateCount, oldUntilUnixNS, newFromUnixNS, oldSupersededTransitions)
+	if currentCount != 1 || candidateCount != 0 || oldUntilUnixNS != cutover.UnixNano() || newFromUnixNS != cutover.UnixNano() || newUntilUnixNS != replacementEnd.UnixNano() || oldSupersededTransitions != 1 {
+		t.Fatalf("blue-green persistence current=%d candidate=%d old_until_ns=%d new_from_ns=%d new_until_ns=%d old_transitions=%d", currentCount, candidateCount, oldUntilUnixNS, newFromUnixNS, newUntilUnixNS, oldSupersededTransitions)
 	}
 }
 
