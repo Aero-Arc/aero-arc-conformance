@@ -720,21 +720,24 @@ func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignmen
 	for _, transition := range evaluation.Transitions {
 		incidentKey := string(transition.Violation)
 		incidentID := stableID("incident", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, transition.OpeningFrameID)
-		eventID := stableID("event", assignment.ID, fmt.Sprint(assignment.Generation), incidentID, string(transition.Transition), transition.FrameID)
+		// Keep the v1 event identity stable across migration. Incident occurrence
+		// safety comes from the immutable incident_id conflict predicate below.
+		eventID := stableID("event", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, string(transition.Transition), transition.FrameID)
 		if transition.Transition == domain.TransitionOpened {
-			err = tx.QueryRow(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$5,$6)
+			err = tx.QueryRow(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details,opening_frame_id) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$5,$6,$7)
 ON CONFLICT (incident_id) DO UPDATE SET incident_id=EXCLUDED.incident_id
 WHERE conformance_incidents.assignment_id=EXCLUDED.assignment_id
   AND conformance_incidents.assignment_generation=EXCLUDED.assignment_generation
   AND conformance_incidents.incident_key=EXCLUDED.incident_key
   AND conformance_incidents.violation_type=EXCLUDED.violation_type
   AND conformance_incidents.opened_at=EXCLUDED.opened_at
-RETURNING incident_id`, incidentID, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt, payload).Scan(&incidentID)
+  AND conformance_incidents.opening_frame_id=EXCLUDED.opening_frame_id
+RETURNING incident_id`, incidentID, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt, payload, transition.OpeningFrameID).Scan(&incidentID)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("incident %s conflicts with immutable opening evidence: %w", incidentID, ErrMessageConflict)
 			}
 		} else if transition.Transition == domain.TransitionResolved {
-			err = tx.QueryRow(ctx, `SELECT incident_id FROM conformance_incidents WHERE incident_id=$1 AND assignment_id=$2 AND assignment_generation=$3 AND incident_key=$4 AND opened_at<=$5 FOR UPDATE`, incidentID, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt).Scan(&incidentID)
+			err = tx.QueryRow(ctx, `SELECT incident_id FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2 AND incident_key=$3 AND opening_frame_id=$4 AND opened_at<=$5 FOR UPDATE`, assignment.ID, assignment.Generation, incidentKey, transition.OpeningFrameID, transition.ObservedAt).Scan(&incidentID)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("resolve %s incident occurrence: matching opening not found", incidentKey)
 			}
@@ -742,14 +745,14 @@ RETURNING incident_id`, incidentID, assignment.ID, assignment.Generation, incide
 		if err != nil {
 			return fmt.Errorf("mutate incident: %w", err)
 		}
-		evidencePayload, marshalErr := json.Marshal(transitionEvidence{SchemaVersion: 1, IncidentID: incidentID, Violation: transition.Violation, Transition: transition.Transition, ObservedAt: transition.ObservedAt, FrameID: transition.FrameID, OpeningFrameID: transition.OpeningFrameID, WALID: transition.WALID, WALSequence: transition.WALSequence, DeviationM: transition.DeviationM})
+		evidencePayload, marshalErr := json.Marshal(transitionEvidence{SchemaVersion: 2, IncidentID: incidentID, Violation: transition.Violation, Transition: transition.Transition, ObservedAt: transition.ObservedAt, FrameID: transition.FrameID, OpeningFrameID: transition.OpeningFrameID, WALID: transition.WALID, WALSequence: transition.WALSequence, DeviationM: transition.DeviationM})
 		if marshalErr != nil {
 			return fmt.Errorf("encode transition evidence: %w", marshalErr)
 		}
 		eventHashBytes := sha256.Sum256(evidencePayload)
 		eventHash := hex.EncodeToString(eventHashBytes[:])
 		var returnedID string
-		err = tx.QueryRow(ctx, `INSERT INTO conformance_events(event_id,assignment_id,assignment_generation,incident_id,transition,violation_type,observed_at,frame_id,wal_id,wal_sequence,evaluation_revision,payload,payload_sha256,deviation_m) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		err = tx.QueryRow(ctx, `INSERT INTO conformance_events(event_id,assignment_id,assignment_generation,incident_id,transition,violation_type,observed_at,frame_id,wal_id,wal_sequence,evaluation_revision,payload,payload_sha256,deviation_m,evidence_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,2)
 ON CONFLICT(event_id) DO UPDATE SET event_id=EXCLUDED.event_id
 WHERE conformance_events.assignment_id=EXCLUDED.assignment_id
   AND conformance_events.assignment_generation=EXCLUDED.assignment_generation
@@ -760,8 +763,9 @@ WHERE conformance_events.assignment_id=EXCLUDED.assignment_id
   AND conformance_events.frame_id=EXCLUDED.frame_id
   AND conformance_events.wal_id=EXCLUDED.wal_id
   AND conformance_events.wal_sequence=EXCLUDED.wal_sequence
-  AND conformance_events.deviation_m=EXCLUDED.deviation_m
-  AND conformance_events.payload_sha256=EXCLUDED.payload_sha256
+	AND (conformance_events.evidence_version=1 OR (
+	  conformance_events.deviation_m=EXCLUDED.deviation_m
+	  AND conformance_events.payload_sha256=EXCLUDED.payload_sha256))
 RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, transition.Transition, transition.Violation, transition.ObservedAt, transition.FrameID, transition.WALID, transition.WALSequence, revision, evidencePayload, eventHash, transition.DeviationM).Scan(&returnedID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("event %s conflicts with immutable evidence: %w", eventID, ErrMessageConflict)

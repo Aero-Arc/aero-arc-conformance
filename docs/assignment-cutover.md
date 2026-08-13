@@ -67,6 +67,12 @@ evidence, not mutable batch-final evaluator state. Replay can therefore move an
 incident's current resolution pointer to a newly discovered resolution event
 while retaining every prior resolution event for audit.
 
+Migration from the prototype schema preserves its event IDs and legacy payloads.
+It backfills incident occurrence identity from the immutable opening event and
+enriches open/recovering checkpoints before workers resume. New events use the
+transition-local evidence format; exact replay reuses legacy rows rather than
+rewriting or double-counting them.
+
 PostgreSQL `timestamptz` is retained for readable audit timestamps, but it has
 microsecond precision. Authority comparisons use companion signed Unix-
 nanosecond columns so two telemetry frames around a sub-microsecond boundary

@@ -64,6 +64,7 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 		t.Fatalf("v1 authority remained open at its exclusive end: found=%v err=%v", found, err)
 	}
 	assertVersionOneWatermarkMigration(t, ctx, dsn, upgraded.ID)
+	assertVersionOneOccurrenceMigration(t, ctx, dsn, first, upgraded)
 
 	terminal := assignment(now, 1, 1)
 	terminal.ID = "assignment-terminal"
@@ -438,16 +439,41 @@ func seedVersionOneActive(t *testing.T, ctx context.Context, dsn string, now tim
 	}
 	value := assignment(now, 1, 1)
 	value.ID = "assignment-upgrade"
-	value.EffectiveFrom = time.Date(2026, 8, 13, 12, 0, 0, 123456789, time.UTC)
-	value.EffectiveUntil = value.EffectiveFrom.Add(time.Hour)
+	value.EffectiveFrom = now.Add(-time.Hour).Truncate(time.Second).Add(123456789 * time.Nanosecond)
+	value.EffectiveUntil = value.EffectiveFrom.Add(2 * time.Hour)
 	raw, err := json.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = conn.Exec(ctx, `INSERT INTO conformance_assignments(assignment_id,assignment_generation,aircraft_id,agent_id,flight_id,intent_id,intent_version,policy_version,lifecycle_state,specification,next_evaluation_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,now()+interval '1 day')`, value.ID, value.Generation, value.AircraftID, value.AgentID, value.FlightID, value.IntentID, value.IntentVersion, value.PolicyVersion, raw); err != nil {
+	if _, err = conn.Exec(ctx, `INSERT INTO conformance_assignments(assignment_id,assignment_generation,aircraft_id,agent_id,flight_id,intent_id,intent_version,policy_version,lifecycle_state,specification,next_evaluation_at,evaluation_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,now(),1)`, value.ID, value.Generation, value.AircraftID, value.AgentID, value.FlightID, value.IntentID, value.IntentVersion, value.PolicyVersion, raw); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = conn.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,frame_id,payload) VALUES($1,$2,1,'conforming','current','confirmed',$3,'v1-frame','{}')`, value.ID, value.Generation, value.EffectiveFrom.Add(time.Second+123*time.Nanosecond)); err != nil {
+	openedAt := value.EffectiveFrom.Add(time.Second)
+	checkpointAt := openedAt.Add(time.Second + 123*time.Nanosecond)
+	legacyPayload := []byte(`{"legacy_batch_state":"recovering"}`)
+	legacyHash := sha256.Sum256(legacyPayload)
+	legacyViolations := []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical, domain.ViolationTemporal}
+	legacyStates := make(map[domain.ViolationType]domain.IncidentState, len(legacyViolations))
+	for index, violation := range legacyViolations {
+		openingFrame := legacyOpeningFrame(violation)
+		incidentID := testStableID("incident", value.ID, fmt.Sprint(value.Generation), string(violation), openingFrame)
+		eventID := testStableID("event", value.ID, fmt.Sprint(value.Generation), string(violation), string(domain.TransitionOpened), openingFrame)
+		if _, err = conn.Exec(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$6,$7)`, incidentID, value.ID, value.Generation, violation, openedAt, checkpointAt, legacyPayload); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = conn.Exec(ctx, `INSERT INTO conformance_events(event_id,assignment_id,assignment_generation,incident_id,transition,violation_type,observed_at,frame_id,wal_id,wal_sequence,evaluation_revision,payload,payload_sha256) VALUES($1,$2,$3,$4,'opened',$5,$6,$7,'v1-wal',$8,1,$9,$10)`, eventID, value.ID, value.Generation, incidentID, violation, openedAt, openingFrame, index+1, legacyPayload, hex.EncodeToString(legacyHash[:])); err != nil {
+			t.Fatal(err)
+		}
+		legacyStates[violation] = domain.IncidentState{Phase: domain.IncidentRecovering, OpenedAt: openedAt, LastObservedAt: checkpointAt}
+	}
+	legacyState, err := json.Marshal(domain.EvaluatorState{Violations: legacyStates})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,1,$3,'v1-wal',2,'v1-checkpoint',$4)`, value.ID, value.Generation, checkpointAt, legacyState); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,frame_id,payload) VALUES($1,$2,1,'recovering','current','confirmed',$3,'v1-checkpoint','{}')`, value.ID, value.Generation, checkpointAt); err != nil {
 		t.Fatal(err)
 	}
 	return value
@@ -468,6 +494,72 @@ func assertVersionOneWatermarkMigration(t *testing.T, ctx context.Context, dsn, 
 	if want := observedAt.UnixMicro()*1000 + 999; observedUnixNS != want {
 		t.Fatalf("v1 watermark migration=%d want conservative microsecond end %d", observedUnixNS, want)
 	}
+}
+
+func assertVersionOneOccurrenceMigration(t *testing.T, ctx context.Context, dsn string, store *postgresstore.Store, assignment domain.Assignment) {
+	t.Helper()
+	checkpoint, found, err := store.GetReplayCheckpoint(ctx, assignment.ID, assignment.Generation, assignment.EffectiveUntil)
+	if err != nil || !found {
+		t.Fatalf("migrated checkpoint found=%v err=%v", found, err)
+	}
+	for _, violation := range []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical, domain.ViolationTemporal} {
+		state := checkpoint.State.Violations[violation]
+		if state.OpeningFrameID != legacyOpeningFrame(violation) || state.Phase != domain.IncidentRecovering {
+			t.Fatalf("migrated %s occurrence state=%#v", violation, state)
+		}
+	}
+	openingFrame := legacyOpeningFrame(domain.ViolationLateral)
+	claims, err := store.ClaimDueAssignments(ctx, "v1-recovery-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.ID != assignment.ID {
+		t.Fatalf("migrated recovery claim=%#v err=%v", claims, err)
+	}
+	openedAt := assignment.EffectiveFrom.Add(time.Second)
+	resolvedAt := checkpoint.StateThroughAt.Add(time.Second)
+	evaluation := domain.Evaluation{
+		Condition:  domain.ConditionConforming,
+		Monitoring: domain.MonitoringCurrent,
+		Recording:  domain.RecordingPending,
+		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
+		Transitions: []domain.IncidentTransition{
+			{Violation: domain.ViolationLateral, Transition: domain.TransitionOpened, ObservedAt: openedAt, FrameID: openingFrame, OpeningFrameID: openingFrame, WALID: "v1-wal", WALSequence: 1},
+			{Violation: domain.ViolationLateral, Transition: domain.TransitionResolved, ObservedAt: resolvedAt, FrameID: "v2-resolution-frame", OpeningFrameID: openingFrame, WALID: "v1-wal", WALSequence: 3},
+		},
+		ObservedAt: resolvedAt, FrameID: "v2-recovered-batch", WALID: "v1-wal", WALSequence: 3,
+	}
+	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: time.Now().UTC().Add(time.Hour)}); err != nil {
+		t.Fatalf("resolve migrated occurrence: %v", err)
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var incidents, events, legacyEvents, versionTwoEvents int
+	var incidentState, migratedOpeningFrame string
+	if err = conn.QueryRow(ctx, `SELECT
+	(SELECT count(*) FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=1),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=1),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=1 AND evidence_version=1),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=1 AND evidence_version=2),
+	(SELECT state FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=1 AND incident_key='lateral_deviation'),
+	(SELECT opening_frame_id FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=1 AND incident_key='lateral_deviation')`, assignment.ID).Scan(&incidents, &events, &legacyEvents, &versionTwoEvents, &incidentState, &migratedOpeningFrame); err != nil {
+		t.Fatal(err)
+	}
+	if incidents != 3 || events != 4 || legacyEvents != 3 || versionTwoEvents != 1 || incidentState != "resolved" || migratedOpeningFrame != openingFrame {
+		t.Fatalf("migrated replay incidents=%d events=%d legacy=%d v2=%d state=%s opening=%s", incidents, events, legacyEvents, versionTwoEvents, incidentState, migratedOpeningFrame)
+	}
+}
+
+func legacyOpeningFrame(violation domain.ViolationType) string {
+	return "v1-" + string(violation) + "-opening-frame"
+}
+
+func testStableID(parts ...string) string {
+	h := sha256.New()
+	for _, part := range parts {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(part), part)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func activate(t *testing.T, ctx context.Context, store *postgresstore.Store, value domain.Assignment, prefix string, effectiveAt time.Time) {

@@ -31,6 +31,8 @@ boundaries unless an accepted design change explicitly moves them:
   watermark; never delete or reassign evidence whose outbox may be delivered.
 - Incident transitions own their WAL cursor and stable opening-frame occurrence
   identity. Immutable event payloads must not contain mutable batch-final state.
+- Schema migrations must preserve immutable event IDs and enrich legacy
+  checkpoint occurrence identity before new validation becomes mandatory.
 - Claim and renewal use PostgreSQL time. An expired lease must never be revived.
 - Summary, incidents, transition events, checkpoint, and delivery outbox commit
   atomically behind the current assignment lease.
