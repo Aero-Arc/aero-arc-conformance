@@ -51,6 +51,33 @@ func TestEvaluatorOpensAndResolvesIndependentIncidents(t *testing.T) {
 	}
 }
 
+func TestEvaluateBatchTransitionsKeepOccurrenceAndOwnWALCursor(t *testing.T) {
+	now := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})
+	a := testAssignment(now)
+	opened := observation(now, 41, 35.02, -97.02, 100)
+	resolved := observation(now.Add(time.Second), 42, 35.005, -97.005, 100)
+	result, err := e.EvaluateBatch(a, []domain.Observation{opened, resolved}, domain.EvaluatorState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opening, resolution *domain.IncidentTransition
+	for i := range result.Transitions {
+		transition := &result.Transitions[i]
+		if transition.Violation != domain.ViolationLateral {
+			continue
+		}
+		if transition.Transition == domain.TransitionOpened {
+			opening = transition
+		} else if transition.Transition == domain.TransitionResolved {
+			resolution = transition
+		}
+	}
+	if opening == nil || resolution == nil || opening.OpeningFrameID != opened.FrameID || resolution.OpeningFrameID != opened.FrameID || opening.WALID != opened.WALID || opening.WALSequence != opened.WALSequence || resolution.WALID != resolved.WALID || resolution.WALSequence != resolved.WALSequence {
+		t.Fatalf("transition correlation opening=%#v resolution=%#v", opening, resolution)
+	}
+}
+
 func TestEvaluatorDoesNotGuessAltitudeReference(t *testing.T) {
 	now := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
 	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})

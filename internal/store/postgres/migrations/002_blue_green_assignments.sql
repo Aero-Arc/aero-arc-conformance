@@ -7,6 +7,30 @@ ALTER TABLE conformance_assignments
   ADD COLUMN armed_at timestamptz,
   ADD COLUMN cutover_at timestamptz;
 
+-- Exact event-time watermarks are required to reject a retroactive cutover
+-- that would strand already-committed evidence beyond the new boundary.
+-- Version 1 stored only microsecond timestamps, so its migrated watermark is
+-- conservatively rounded to the end of that unknown nanosecond interval.
+ALTER TABLE conformance_summaries
+  ADD COLUMN observed_at_unix_ns bigint;
+
+UPDATE conformance_summaries
+SET observed_at_unix_ns = floor(extract(epoch FROM observed_at) * 1000000)::bigint * 1000 + 999;
+
+ALTER TABLE conformance_summaries
+  ALTER COLUMN observed_at_unix_ns SET NOT NULL;
+
+-- Version 2 transition events keep their own immutable deviation evidence;
+-- the event no longer derives identity from mutable batch-final evaluator
+-- state. Existing version 1 rows default to the evidence their schema carried.
+ALTER TABLE conformance_events
+  ADD COLUMN deviation_m double precision NOT NULL DEFAULT 0;
+
+ALTER TABLE conformance_incidents
+  ADD COLUMN resolution_event_id text,
+  ADD CONSTRAINT conformance_incident_resolution_event
+    FOREIGN KEY (resolution_event_id) REFERENCES conformance_events(event_id);
+
 -- Version 1 used received/armed as claimable prototype states. Retire any such
 -- rows and use new candidate-only names so a rolled-back binary cannot claim a
 -- blue-green candidate by mistake.

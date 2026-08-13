@@ -143,13 +143,17 @@ const (
 )
 
 type IncidentState struct {
-	Phase              IncidentPhase `json:"phase"`
-	ConsecutiveOutside int           `json:"consecutive_outside"`
-	ConsecutiveInside  int           `json:"consecutive_inside"`
-	FirstSuspectedAt   time.Time     `json:"first_suspected_at,omitempty"`
-	OpenedAt           time.Time     `json:"opened_at,omitempty"`
-	LastObservedAt     time.Time     `json:"last_observed_at,omitempty"`
-	WorstDeviationM    float64       `json:"worst_deviation_m,omitempty"`
+	Phase IncidentPhase `json:"phase"`
+	// OpeningFrameID is the stable identity of this incident occurrence. It
+	// survives recovery hysteresis so replay can amend the same episode without
+	// guessing from timestamps or another occurrence of the same violation.
+	OpeningFrameID     string    `json:"opening_frame_id,omitempty"`
+	ConsecutiveOutside int       `json:"consecutive_outside"`
+	ConsecutiveInside  int       `json:"consecutive_inside"`
+	FirstSuspectedAt   time.Time `json:"first_suspected_at,omitempty"`
+	OpenedAt           time.Time `json:"opened_at,omitempty"`
+	LastObservedAt     time.Time `json:"last_observed_at,omitempty"`
+	WorstDeviationM    float64   `json:"worst_deviation_m,omitempty"`
 }
 
 type EvaluatorState struct {
@@ -165,11 +169,14 @@ const (
 )
 
 type IncidentTransition struct {
-	Violation  ViolationType `json:"violation"`
-	Transition Transition    `json:"transition"`
-	ObservedAt time.Time     `json:"observed_at"`
-	FrameID    string        `json:"frame_id"`
-	DeviationM float64       `json:"deviation_m,omitempty"`
+	Violation      ViolationType `json:"violation"`
+	Transition     Transition    `json:"transition"`
+	ObservedAt     time.Time     `json:"observed_at"`
+	FrameID        string        `json:"frame_id"`
+	OpeningFrameID string        `json:"opening_frame_id"`
+	WALID          string        `json:"wal_id"`
+	WALSequence    uint64        `json:"wal_sequence"`
+	DeviationM     float64       `json:"deviation_m,omitempty"`
 }
 
 type Evaluation struct {

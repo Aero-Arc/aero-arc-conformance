@@ -359,13 +359,28 @@ func (s *Store) CutoverAssignment(ctx context.Context, source, messageID, assign
 	var currentAuthorityFromUnixNS int64
 	var currentAuthorityUntilUnixNS int64
 	var currentLifecycle string
+	var currentEvaluationWatermarkUnixNS *int64
 	err = tx.QueryRow(ctx, `SELECT assignment_generation,authority_from_unix_ns,authority_until_unix_ns,lifecycle_state FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('active','ending') FOR UPDATE`, assignmentID).Scan(&currentGeneration, &currentAuthorityFromUnixNS, &currentAuthorityUntilUnixNS, &currentLifecycle)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return LifecycleResult{}, err
 	}
 	if err == nil {
+		// Read the watermark in a separate READ COMMITTED statement after the
+		// assignment lock. If an evaluation commit won the lock first, this fresh
+		// snapshot must observe the summary committed in that same transaction.
+		err = tx.QueryRow(ctx, `SELECT observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2`, assignmentID, currentGeneration).Scan(&currentEvaluationWatermarkUnixNS)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return LifecycleResult{}, err
+		}
 		if currentGeneration >= generation || effectiveUnixNS <= currentAuthorityFromUnixNS || effectiveUnixNS > currentAuthorityUntilUnixNS {
 			return LifecycleResult{}, ErrStaleAssignment
+		}
+		// The old generation's summary is its monotonic durable event-time
+		// watermark. Rejecting equality is intentional: authority_until is
+		// exclusive, and committed evidence at the boundary cannot be reassigned
+		// after its Registry outbox may already have been delivered.
+		if currentEvaluationWatermarkUnixNS != nil && *currentEvaluationWatermarkUnixNS >= effectiveUnixNS {
+			return LifecycleResult{}, fmt.Errorf("%w: cutover precedes committed evaluation watermark", ErrInvalidTransition)
 		}
 		if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='superseded',authority_until=$1,authority_until_unix_ns=$2,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$3 AND assignment_generation=$4 AND lifecycle_state IN ('active','ending')`, effectiveAt, effectiveUnixNS, assignmentID, currentGeneration); err != nil {
 			return LifecycleResult{}, err
@@ -662,13 +677,32 @@ func validateEvaluationCommit(commit EvaluationCommit) error {
 	if commit.NextEvaluationAt.IsZero() || commit.Evaluation.ObservedAt.IsZero() || !supportedUnixNanoseconds(commit.Evaluation.ObservedAt) || commit.Evaluation.FrameID == "" || commit.Evaluation.WALID == "" || commit.Evaluation.WALSequence > math.MaxInt64 {
 		return fmt.Errorf("evaluation commit is incomplete")
 	}
+	for _, transition := range commit.Evaluation.Transitions {
+		if transition.ObservedAt.IsZero() || !supportedUnixNanoseconds(transition.ObservedAt) || transition.ObservedAt.After(commit.Evaluation.ObservedAt) || transition.FrameID == "" || transition.OpeningFrameID == "" || transition.WALID == "" || transition.WALSequence > math.MaxInt64 {
+			return fmt.Errorf("evaluation transition is incomplete or beyond its watermark")
+		}
+	}
 	return nil
 }
 
+type transitionEvidence struct {
+	SchemaVersion  uint32               `json:"schema_version"`
+	IncidentID     string               `json:"incident_id"`
+	Violation      domain.ViolationType `json:"violation"`
+	Transition     domain.Transition    `json:"transition"`
+	ObservedAt     time.Time            `json:"observed_at"`
+	FrameID        string               `json:"frame_id"`
+	OpeningFrameID string               `json:"opening_frame_id"`
+	WALID          string               `json:"wal_id"`
+	WALSequence    uint64               `json:"wal_sequence"`
+	DeviationM     float64              `json:"deviation_m"`
+}
+
 func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignment, revision uint64, evaluation domain.Evaluation, allowEqualWatermark, publishLive bool) error {
-	var currentObservedAt time.Time
-	err := tx.QueryRow(ctx, `SELECT observed_at FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2 FOR UPDATE`, assignment.ID, assignment.Generation).Scan(&currentObservedAt)
-	if err == nil && (evaluation.ObservedAt.Before(currentObservedAt) || (!allowEqualWatermark && evaluation.ObservedAt.Equal(currentObservedAt))) {
+	var currentObservedUnixNS int64
+	err := tx.QueryRow(ctx, `SELECT observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2 FOR UPDATE`, assignment.ID, assignment.Generation).Scan(&currentObservedUnixNS)
+	evaluationUnixNS := evaluation.ObservedAt.UnixNano()
+	if err == nil && (evaluationUnixNS < currentObservedUnixNS || (!allowEqualWatermark && evaluationUnixNS == currentObservedUnixNS)) {
 		return ErrStaleEvaluation
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -685,10 +719,9 @@ func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignmen
 	}
 	for _, transition := range evaluation.Transitions {
 		incidentKey := string(transition.Violation)
-		incidentID := ""
-		eventID := stableID("event", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, string(transition.Transition), transition.FrameID)
+		incidentID := stableID("incident", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, transition.OpeningFrameID)
+		eventID := stableID("event", assignment.ID, fmt.Sprint(assignment.Generation), incidentID, string(transition.Transition), transition.FrameID)
 		if transition.Transition == domain.TransitionOpened {
-			incidentID = stableID("incident", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, transition.FrameID)
 			err = tx.QueryRow(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$5,$6)
 ON CONFLICT (incident_id) DO UPDATE SET incident_id=EXCLUDED.incident_id
 WHERE conformance_incidents.assignment_id=EXCLUDED.assignment_id
@@ -701,35 +734,55 @@ RETURNING incident_id`, incidentID, assignment.ID, assignment.Generation, incide
 				return fmt.Errorf("incident %s conflicts with immutable opening evidence: %w", incidentID, ErrMessageConflict)
 			}
 		} else if transition.Transition == domain.TransitionResolved {
-			err = tx.QueryRow(ctx, `UPDATE conformance_incidents SET state='resolved',resolved_at=$1,last_observed_at=$1,revision=revision+1,details=$2 WHERE assignment_id=$3 AND assignment_generation=$4 AND incident_key=$5 AND state='open' RETURNING incident_id`, transition.ObservedAt, payload, assignment.ID, assignment.Generation, incidentKey).Scan(&incidentID)
+			err = tx.QueryRow(ctx, `SELECT incident_id FROM conformance_incidents WHERE incident_id=$1 AND assignment_id=$2 AND assignment_generation=$3 AND incident_key=$4 AND opened_at<=$5 FOR UPDATE`, incidentID, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt).Scan(&incidentID)
 			if errors.Is(err, pgx.ErrNoRows) {
-				// Deterministic suffix replay may encounter the same resolution
-				// after the incident is already resolved. Reuse only the exact
-				// immutable resolution occurrence; never resolve another episode.
-				err = tx.QueryRow(ctx, `SELECT incident_id FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2 AND incident_key=$3 AND state='resolved' AND resolved_at=$4 ORDER BY opened_at DESC LIMIT 1 FOR UPDATE`, assignment.ID, assignment.Generation, incidentKey, transition.ObservedAt).Scan(&incidentID)
-				if errors.Is(err, pgx.ErrNoRows) {
-					return fmt.Errorf("resolve %s incident: matching incident not found", incidentKey)
-				}
+				return fmt.Errorf("resolve %s incident occurrence: matching opening not found", incidentKey)
 			}
 		}
 		if err != nil {
 			return fmt.Errorf("mutate incident: %w", err)
 		}
-		eventHashBytes := sha256.Sum256(payload)
+		evidencePayload, marshalErr := json.Marshal(transitionEvidence{SchemaVersion: 1, IncidentID: incidentID, Violation: transition.Violation, Transition: transition.Transition, ObservedAt: transition.ObservedAt, FrameID: transition.FrameID, OpeningFrameID: transition.OpeningFrameID, WALID: transition.WALID, WALSequence: transition.WALSequence, DeviationM: transition.DeviationM})
+		if marshalErr != nil {
+			return fmt.Errorf("encode transition evidence: %w", marshalErr)
+		}
+		eventHashBytes := sha256.Sum256(evidencePayload)
 		eventHash := hex.EncodeToString(eventHashBytes[:])
 		var returnedID string
-		err = tx.QueryRow(ctx, `INSERT INTO conformance_events(event_id,assignment_id,assignment_generation,incident_id,transition,violation_type,observed_at,frame_id,wal_id,wal_sequence,evaluation_revision,payload,payload_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE conformance_events.payload_sha256=EXCLUDED.payload_sha256 AND conformance_events.observed_at=EXCLUDED.observed_at AND conformance_events.frame_id=EXCLUDED.frame_id AND conformance_events.wal_id=EXCLUDED.wal_id AND conformance_events.wal_sequence=EXCLUDED.wal_sequence RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, transition.Transition, transition.Violation, transition.ObservedAt, transition.FrameID, evaluation.WALID, evaluation.WALSequence, revision, payload, eventHash).Scan(&returnedID)
+		err = tx.QueryRow(ctx, `INSERT INTO conformance_events(event_id,assignment_id,assignment_generation,incident_id,transition,violation_type,observed_at,frame_id,wal_id,wal_sequence,evaluation_revision,payload,payload_sha256,deviation_m) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ON CONFLICT(event_id) DO UPDATE SET event_id=EXCLUDED.event_id
+WHERE conformance_events.assignment_id=EXCLUDED.assignment_id
+  AND conformance_events.assignment_generation=EXCLUDED.assignment_generation
+  AND conformance_events.incident_id=EXCLUDED.incident_id
+  AND conformance_events.transition=EXCLUDED.transition
+  AND conformance_events.violation_type=EXCLUDED.violation_type
+  AND conformance_events.observed_at=EXCLUDED.observed_at
+  AND conformance_events.frame_id=EXCLUDED.frame_id
+  AND conformance_events.wal_id=EXCLUDED.wal_id
+  AND conformance_events.wal_sequence=EXCLUDED.wal_sequence
+  AND conformance_events.deviation_m=EXCLUDED.deviation_m
+  AND conformance_events.payload_sha256=EXCLUDED.payload_sha256
+RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, transition.Transition, transition.Violation, transition.ObservedAt, transition.FrameID, transition.WALID, transition.WALSequence, revision, evidencePayload, eventHash, transition.DeviationM).Scan(&returnedID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("event %s conflicts with immutable evidence: %w", eventID, ErrMessageConflict)
 		}
 		if err != nil {
 			return fmt.Errorf("insert event: %w", err)
 		}
+		if transition.Transition == domain.TransitionResolved {
+			tag, updateErr := tx.Exec(ctx, `UPDATE conformance_incidents SET state='resolved',resolved_at=$1,resolution_event_id=$2,last_observed_at=$1,revision=revision+CASE WHEN resolution_event_id IS DISTINCT FROM $2 THEN 1 ELSE 0 END,details=$3 WHERE incident_id=$4 AND assignment_id=$5 AND assignment_generation=$6 AND incident_key=$7`, transition.ObservedAt, returnedID, payload, incidentID, assignment.ID, assignment.Generation, incidentKey)
+			if updateErr != nil {
+				return fmt.Errorf("materialize incident resolution: %w", updateErr)
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf("materialize incident resolution: matching occurrence not found")
+			}
+		}
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, assignment.ID, assignment.Generation, revision, evaluation.ObservedAt, evaluation.WALID, evaluation.WALSequence, evaluation.FrameID, state); err != nil {
 		return fmt.Errorf("insert checkpoint: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,frame_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(assignment_id,assignment_generation) DO UPDATE SET evaluation_revision=EXCLUDED.evaluation_revision,condition=EXCLUDED.condition,monitoring_status=EXCLUDED.monitoring_status,recording_status=EXCLUDED.recording_status,observed_at=EXCLUDED.observed_at,frame_id=EXCLUDED.frame_id,payload=EXCLUDED.payload,updated_at=now()`, assignment.ID, assignment.Generation, revision, evaluation.Condition, evaluation.Monitoring, domain.RecordingConfirmed, evaluation.ObservedAt, evaluation.FrameID, payload); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,observed_at_unix_ns,frame_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_id,assignment_generation) DO UPDATE SET evaluation_revision=EXCLUDED.evaluation_revision,condition=EXCLUDED.condition,monitoring_status=EXCLUDED.monitoring_status,recording_status=EXCLUDED.recording_status,observed_at=EXCLUDED.observed_at,observed_at_unix_ns=EXCLUDED.observed_at_unix_ns,frame_id=EXCLUDED.frame_id,payload=EXCLUDED.payload,updated_at=now()`, assignment.ID, assignment.Generation, revision, evaluation.Condition, evaluation.Monitoring, domain.RecordingConfirmed, evaluation.ObservedAt, evaluation.ObservedAt.UnixNano(), evaluation.FrameID, payload); err != nil {
 		return fmt.Errorf("upsert summary: %w", err)
 	}
 	if publishLive {

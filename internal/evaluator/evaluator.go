@@ -208,7 +208,8 @@ func (e *Evaluator) advance(v domain.ViolationType, state domain.IncidentState, 
 		if state.Phase == domain.IncidentSuspected && state.ConsecutiveOutside >= e.policy.OpenAfterSamples {
 			state.Phase = domain.IncidentOpen
 			state.OpenedAt = state.FirstSuspectedAt
-			return state, &domain.IncidentTransition{Violation: v, Transition: domain.TransitionOpened, ObservedAt: o.ObservedAt, FrameID: o.FrameID, DeviationM: deviation}
+			state.OpeningFrameID = o.FrameID
+			return state, &domain.IncidentTransition{Violation: v, Transition: domain.TransitionOpened, ObservedAt: o.ObservedAt, FrameID: o.FrameID, OpeningFrameID: o.FrameID, WALID: o.WALID, WALSequence: o.WALSequence, DeviationM: deviation}
 		}
 		return state, nil
 	}
@@ -223,7 +224,7 @@ func (e *Evaluator) advance(v domain.ViolationType, state domain.IncidentState, 
 		state.Phase = domain.IncidentRecovering
 	}
 	if state.Phase == domain.IncidentRecovering && state.ConsecutiveInside >= e.policy.RecoverAfterSamples {
-		resolved := &domain.IncidentTransition{Violation: v, Transition: domain.TransitionResolved, ObservedAt: o.ObservedAt, FrameID: o.FrameID}
+		resolved := &domain.IncidentTransition{Violation: v, Transition: domain.TransitionResolved, ObservedAt: o.ObservedAt, FrameID: o.FrameID, OpeningFrameID: state.OpeningFrameID, WALID: o.WALID, WALSequence: o.WALSequence}
 		return domain.IncidentState{Phase: domain.IncidentClear, LastObservedAt: o.ObservedAt}, resolved
 	}
 	if state.Phase == "" {

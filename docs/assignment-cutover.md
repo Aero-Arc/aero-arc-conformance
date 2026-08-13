@@ -27,6 +27,13 @@ The lifecycle is:
    its exclusive `authority_until`, clears its lease, and activates the armed
    candidate with `authority_from = effective_at`.
 
+The cutover transaction also locks the current generation and compares the
+proposed boundary with its exact durable evaluation watermark. A boundary at or
+before already committed evidence is rejected. This is deliberately
+conservative: its Registry outbox may already have been delivered, so silently
+moving or deleting that evidence would create two histories. The API must
+choose a later safe boundary or enter an explicit reconciliation workflow.
+
 Pending geometry never expands authorization. The evaluator must never union
 the current and candidate volumes.
 
@@ -54,6 +61,12 @@ historical summary and checkpoint remain generation-scoped and no Registry live
 projection is emitted, so reconciliation cannot roll generation 8 live state
 backward.
 
+Incident transitions carry the opening frame of their exact occurrence and the
+transition's own WAL cursor. Immutable event rows contain only that transition
+evidence, not mutable batch-final evaluator state. Replay can therefore move an
+incident's current resolution pointer to a newly discovered resolution event
+while retaining every prior resolution event for audit.
+
 PostgreSQL `timestamptz` is retained for readable audit timestamps, but it has
 microsecond precision. Authority comparisons use companion signed Unix-
 nanosecond columns so two telemetry frames around a sub-microsecond boundary
@@ -73,6 +86,9 @@ cannot be rounded onto the wrong generation.
 - A delayed pre-cutover observation can be reconciled only through a valid
   current-generation lease; an out-of-interval attempt rolls back without
   consuming that lease.
+- A retroactive cutover at or before the old generation's committed event-time
+  watermark is rejected without recording its inbox command or mutating either
+  generation.
 - Lower assignment generations are recorded as stale and cannot resurrect.
 - The transition history and API outbox are written in the same transaction as
   every lifecycle change.
@@ -88,3 +104,9 @@ external Protobuf API and worker runtime remain a later slice. That contract
 should carry assignment ID, assignment generation, exact intent ID/version,
 stable message ID, and cutover `effective_at`. Reconciliation should compare the
 API's current and pending generations with Conformance after ambiguous delivery.
+
+The current store supports exact suffix replay and a shifted resolution for a
+stable incident occurrence. A future arbitrary-suffix reconciliation contract
+must also identify the replaced replay range and materialize which immutable
+events remain active; otherwise replay cannot safely retract a transition that
+disappears entirely or merge two previously distinct occurrences.

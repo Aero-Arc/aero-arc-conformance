@@ -158,6 +158,12 @@ Every current interval ends at the immutable assignment `effective_until`.
 Delayed observations for a superseded interval are committed as historical
 reconciliation behind the current generation's lease; they update only the
 historical generation and never enqueue a current Registry projection.
+Cutover rejects a boundary at or before the current generation's exact durable
+evaluation watermark, because previously delivered live evidence cannot be
+silently reassigned. Incident occurrence identity and transition-local WAL
+cursors let bounded replay preserve immutable evidence while revising the
+current resolution pointer. General replay that removes or merges prior
+transitions still requires an explicit replay range and active-event projection.
 
 ## Worker death and reclaim
 

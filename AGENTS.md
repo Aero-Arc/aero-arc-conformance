@@ -27,6 +27,10 @@ boundaries unless an accepted design change explicitly moves them:
 - Historical reconciliation must be fenced by the current generation's lease,
   remain scoped to the superseded authority interval, and never publish a live
   Registry projection or revive a superseded lease.
+- Reject a cutover at or before the current generation's committed evaluation
+  watermark; never delete or reassign evidence whose outbox may be delivered.
+- Incident transitions own their WAL cursor and stable opening-frame occurrence
+  identity. Immutable event payloads must not contain mutable batch-final state.
 - Claim and renewal use PostgreSQL time. An expired lease must never be revived.
 - Summary, incidents, transition events, checkpoint, and delivery outbox commit
   atomically behind the current assignment lease.
