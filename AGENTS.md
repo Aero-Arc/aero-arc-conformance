@@ -27,6 +27,9 @@ boundaries unless an accepted design change explicitly moves them:
 - Historical reconciliation must be fenced by the current generation's lease,
   remain scoped to the superseded authority interval, and never publish a live
   Registry projection or revive a superseded lease.
+- Every evaluation carries its earliest causal observation/state timestamp;
+  commits fence that start, every transition/state timestamp, and the final
+  watermark to one stored half-open assignment authority interval.
 - Reject a cutover at or before the current generation's committed evaluation
   watermark; never delete or reassign evidence whose outbox may be delivered.
 - Incident transitions own their WAL cursor and stable opening-frame occurrence

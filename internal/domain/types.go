@@ -185,8 +185,12 @@ type Evaluation struct {
 	Recording   RecordingStatus      `json:"recording"`
 	State       EvaluatorState       `json:"state"`
 	Transitions []IncidentTransition `json:"transitions"`
-	ObservedAt  time.Time            `json:"observed_at"`
-	FrameID     string               `json:"frame_id"`
-	WALID       string               `json:"wal_id"`
-	WALSequence uint64               `json:"wal_sequence"`
+	// CausalFrom is the earliest observation or retained non-clear incident
+	// timestamp that contributed to this result. Durable commits fence it to the
+	// same assignment authority interval as the final watermark.
+	CausalFrom  time.Time `json:"causal_from"`
+	ObservedAt  time.Time `json:"observed_at"`
+	FrameID     string    `json:"frame_id"`
+	WALID       string    `json:"wal_id"`
+	WALSequence uint64    `json:"wal_sequence"`
 }

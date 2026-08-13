@@ -77,6 +77,23 @@ func TestEvaluateBatchTransitionsKeepOccurrenceAndOwnWALCursor(t *testing.T) {
 	if opening == nil || resolution == nil || opening.OpeningFrameID != opened.FrameID || resolution.OpeningFrameID != opened.FrameID || opening.WALID != opened.WALID || opening.WALSequence != opened.WALSequence || resolution.WALID != resolved.WALID || resolution.WALSequence != resolved.WALSequence {
 		t.Fatalf("transition correlation opening=%#v resolution=%#v", opening, resolution)
 	}
+	if !result.CausalFrom.Equal(opened.ObservedAt) || !result.ObservedAt.Equal(resolved.ObservedAt) {
+		t.Fatalf("batch causal interval = [%s,%s], want [%s,%s]", result.CausalFrom, result.ObservedAt, opened.ObservedAt, resolved.ObservedAt)
+	}
+	if _, err = e.EvaluateBatch(a, []domain.Observation{resolved, opened}, domain.EvaluatorState{}); err == nil {
+		t.Fatal("out-of-order event-time batch was accepted")
+	}
+	priorStart := now.Add(-time.Second)
+	previous := domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral: {Phase: domain.IncidentSuspected, FirstSuspectedAt: priorStart, LastObservedAt: priorStart},
+	}}
+	cleared, err := e.EvaluateBatch(a, []domain.Observation{resolved}, previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared.CausalFrom.Equal(priorStart) {
+		t.Fatalf("cleared batch lost retained causal start: got %s want %s", cleared.CausalFrom, priorStart)
+	}
 }
 
 func TestEvaluatorDoesNotGuessAltitudeReference(t *testing.T) {

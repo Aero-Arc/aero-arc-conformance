@@ -152,7 +152,7 @@ func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observ
 		condition = domain.ConditionUnknown
 	}
 	_ = now // freshness is assessed from the poll watermark, never event age during replay.
-	return domain.Evaluation{Condition: condition, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: cloned, Transitions: transitions, ObservedAt: observation.ObservedAt, FrameID: observation.FrameID, WALID: observation.WALID, WALSequence: observation.WALSequence}, nil
+	return domain.Evaluation{Condition: condition, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: cloned, Transitions: transitions, CausalFrom: observation.ObservedAt, ObservedAt: observation.ObservedAt, FrameID: observation.FrameID, WALID: observation.WALID, WALSequence: observation.WALSequence}, nil
 }
 
 // AssessMonitoring evaluates dependency availability and telemetry silence on a
@@ -175,10 +175,24 @@ func (e *Evaluator) EvaluateBatch(assignment domain.Assignment, observations []d
 	if len(observations) == 0 {
 		return domain.Evaluation{}, fmt.Errorf("%w: empty observation batch", ErrInvalidInput)
 	}
+	causalFrom := observations[0].ObservedAt
+	for _, state := range previous.Violations {
+		if state.Phase == domain.IncidentClear || state.Phase == "" {
+			continue
+		}
+		for _, candidate := range []time.Time{state.FirstSuspectedAt, state.OpenedAt} {
+			if !candidate.IsZero() && candidate.Before(causalFrom) {
+				causalFrom = candidate
+			}
+		}
+	}
 	allTransitions := make([]domain.IncidentTransition, 0)
 	var result domain.Evaluation
 	var err error
-	for _, observation := range observations {
+	for index, observation := range observations {
+		if index > 0 && observation.ObservedAt.Before(observations[index-1].ObservedAt) {
+			return domain.Evaluation{}, fmt.Errorf("%w: observation batch is not event-time ordered", ErrInvalidInput)
+		}
 		result, err = e.Evaluate(observation.ObservedAt, assignment, observation, previous)
 		if err != nil {
 			return domain.Evaluation{}, err
@@ -187,6 +201,7 @@ func (e *Evaluator) EvaluateBatch(assignment domain.Assignment, observations []d
 		allTransitions = append(allTransitions, result.Transitions...)
 	}
 	result.Transitions = allTransitions
+	result.CausalFrom = causalFrom
 	return result, nil
 }
 

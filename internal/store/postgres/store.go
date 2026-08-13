@@ -682,7 +682,7 @@ func (s *Store) CommitHistoricalEvaluation(ctx context.Context, current Claim, h
 }
 
 func validateEvaluationCommit(commit EvaluationCommit) error {
-	if commit.NextEvaluationAt.IsZero() || commit.Evaluation.ObservedAt.IsZero() || !supportedUnixNanoseconds(commit.Evaluation.ObservedAt) || commit.Evaluation.FrameID == "" || commit.Evaluation.WALID == "" || commit.Evaluation.WALSequence > math.MaxInt64 {
+	if commit.NextEvaluationAt.IsZero() || commit.Evaluation.CausalFrom.IsZero() || commit.Evaluation.ObservedAt.IsZero() || !supportedUnixNanoseconds(commit.Evaluation.CausalFrom) || !supportedUnixNanoseconds(commit.Evaluation.ObservedAt) || commit.Evaluation.CausalFrom.After(commit.Evaluation.ObservedAt) || commit.Evaluation.FrameID == "" || commit.Evaluation.WALID == "" || commit.Evaluation.WALSequence > math.MaxInt64 {
 		return fmt.Errorf("evaluation commit is incomplete")
 	}
 	for _, transition := range commit.Evaluation.Transitions {
@@ -715,6 +715,9 @@ func validateEvaluationWithinAuthority(evaluation domain.Evaluation, authorityFr
 		return nil
 	}
 	if err := validateTimestamp("evaluation watermark", evaluation.ObservedAt); err != nil {
+		return err
+	}
+	if err := validateTimestamp("evaluation causal start", evaluation.CausalFrom); err != nil {
 		return err
 	}
 	for index, transition := range evaluation.Transitions {

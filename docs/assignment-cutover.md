@@ -61,6 +61,12 @@ historical summary and checkpoint remain generation-scoped and no Registry live
 projection is emitted, so reconciliation cannot roll generation 8 live state
 backward.
 
+An evaluation records both its earliest causal timestamp and its final
+watermark. The commit also checks every transition and retained incident-state
+timestamp against the same stored half-open authority interval. This prevents a
+batch that begins before cutover—but opens and resolves after it—from erasing
+the cross-generation input when its final state becomes clear.
+
 Incident transitions carry the opening frame of their exact occurrence and the
 transition's own WAL cursor. Immutable event rows contain only that transition
 evidence, not mutable batch-final evaluator state. Replay can therefore move an

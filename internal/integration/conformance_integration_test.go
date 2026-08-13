@@ -326,7 +326,7 @@ func assertBlueGreenPersistence(t *testing.T, ctx context.Context, url, assignme
 }
 
 func sampleEvaluation(at time.Time) domain.Evaluation {
-	return domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: at, FrameID: "blue-frame", WALID: "blue-wal", WALSequence: 1}
+	return domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, CausalFrom: at, ObservedAt: at, FrameID: "blue-frame", WALID: "blue-wal", WALSequence: 1}
 }
 
 func assertDurableEvaluation(t *testing.T, ctx context.Context, url, assignmentID string, wantIncidents, wantEvents, wantRevisions int) {

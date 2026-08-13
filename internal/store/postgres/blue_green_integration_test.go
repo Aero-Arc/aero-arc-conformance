@@ -82,6 +82,7 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 			{Violation: domain.ViolationLateral, Transition: domain.TransitionOpened, ObservedAt: now.Add(-2 * time.Second), FrameID: "incident-open", OpeningFrameID: "incident-open", WALID: "initial-wal", WALSequence: 1, DeviationM: 4},
 			{Violation: domain.ViolationLateral, Transition: domain.TransitionResolved, ObservedAt: now.Add(-time.Second), FrameID: "incident-resolved", OpeningFrameID: "incident-open", WALID: "initial-wal", WALSequence: 2},
 		},
+		CausalFrom:  now.Add(-2 * time.Second),
 		ObservedAt:  now.Add(-time.Second),
 		FrameID:     "initial-frame",
 		WALID:       "initial-wal",
@@ -253,13 +254,13 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
 		Transitions: []domain.IncidentTransition{{
 			Violation: domain.ViolationLateral, Transition: domain.TransitionOpened,
-			ObservedAt: cutover.Add(-time.Nanosecond), FrameID: "live-cross-boundary",
+			ObservedAt: cutover.Add(time.Nanosecond), FrameID: "live-cross-boundary",
 			OpeningFrameID: "live-cross-boundary", WALID: "live-wal", WALSequence: 1,
 		}},
-		ObservedAt: cutover.Add(time.Microsecond), FrameID: "live-batch", WALID: "live-wal", WALSequence: 2,
+		CausalFrom: cutover.Add(-time.Nanosecond), ObservedAt: cutover.Add(2 * time.Microsecond), FrameID: "live-batch", WALID: "live-wal", WALSequence: 2,
 	}, NextEvaluationAt: time.Now().UTC()}
 	if err = second.CommitEvaluation(ctx, claims[0], invalidLive); !errors.Is(err, postgresstore.ErrInvalidTransition) {
-		t.Fatalf("live transition crossed authority start: %v", err)
+		t.Fatalf("live causal start crossed authority boundary: %v", err)
 	}
 	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
 		t.Fatalf("invalid live batch consumed the lease: %v", err)
@@ -363,7 +364,7 @@ func assertConcurrentCommitCutoverFence(t *testing.T, ctx context.Context, first
 			t.Fatal(err)
 		}
 		boundary := now.Add(-10 * time.Second)
-		evaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: boundary, FrameID: fmt.Sprintf("race-frame-%d", round), WALID: "race-wal", WALSequence: uint64(round + 1)}
+		evaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, CausalFrom: boundary, ObservedAt: boundary, FrameID: fmt.Sprintf("race-frame-%d", round), WALID: "race-wal", WALSequence: uint64(round + 1)}
 		start := make(chan struct{})
 		commitResult := make(chan error, 1)
 		cutoverResult := make(chan error, 1)
@@ -425,7 +426,7 @@ func assertRetroactiveCutoverFence(t *testing.T, ctx context.Context, store *pos
 		t.Fatalf("retro claim=%#v err=%v", claims, err)
 	}
 	watermark := now.Add(-20 * time.Second)
-	evaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, ObservedAt: watermark, FrameID: "retro-frame", WALID: "retro-wal", WALSequence: 1}
+	evaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, CausalFrom: watermark, ObservedAt: watermark, FrameID: "retro-frame", WALID: "retro-wal", WALSequence: 1}
 	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
