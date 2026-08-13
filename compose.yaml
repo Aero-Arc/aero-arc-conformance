@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgis/postgis:14-3.5-alpine
+    environment:
+      POSTGRES_DB: conformance
+      POSTGRES_USER: conformance
+      POSTGRES_PASSWORD: conformance
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conformance -d conformance"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+
+  influxdb:
+    image: influxdb:3.10.3-core
+    command: ["influxdb3", "serve", "--node-id=conformance-local", "--object-store=file", "--data-dir=/var/lib/influxdb3", "--without-auth"]
+    ports: ["127.0.0.1:8181:8181"]
+    volumes: ["influx-data:/var/lib/influxdb3"]
+
+  influx-init:
+    image: curlimages/curl:8.14.1
+    depends_on: [influxdb]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until curl --fail --silent http://influxdb:8181/health >/dev/null; do sleep 1; done
+        status=$$(curl --silent --show-error -o /tmp/influx-init-response -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"db":"conformance"}' http://influxdb:8181/api/v3/configure/database)
+        case "$$status" in 2??|409) ;; *) cat /tmp/influx-init-response; exit 1 ;; esac
+
+  conformance:
+    build: .
+    depends_on:
+      postgres: {condition: service_healthy}
+      influx-init: {condition: service_completed_successfully}
+    environment:
+      AERO_CONFORMANCE_POSTGRES_URL: postgres://conformance:conformance@postgres:5432/conformance?sslmode=disable
+      AERO_CONFORMANCE_INFLUX_HOST: http://influxdb:8181
+      AERO_CONFORMANCE_INFLUX_TOKEN: local-development-no-auth
+      AERO_CONFORMANCE_INFLUX_DATABASE: conformance
+      AERO_CONFORMANCE_WORKER_ID: compose-1
+    ports: ["127.0.0.1:2112:2112"]
+    volumes:
+      - ./configs/config.yaml:/etc/aero-arc/config.yaml:ro
+
+volumes:
+  postgres-data:
+  influx-data:

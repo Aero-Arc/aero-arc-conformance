@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 720" role="img" aria-labelledby="title desc">
+  <title id="title">Aero Arc continuous conformance data flow</title>
+  <desc id="desc">The API sends immutable mission assignments to Conformance. Agent telemetry passes through Relay into InfluxDB and is read by Conformance. Conformance records assignments, checkpoints, and incidents in PostgreSQL, publishes expiring live state to Registry, and the API composes live and durable data for the Ops dashboard.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0d1e36"/><stop offset="1" stop-color="#153c59"/></linearGradient>
+    <filter id="shadow"><feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#020817" flood-opacity=".3"/></filter>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto"><path d="M0 0L11 5.5L0 11Z" fill="#68a5ff"/></marker>
+    <style>
+      .title{font:700 30px 'Segoe UI',Arial,sans-serif;fill:#fff}.sub{font:400 15px 'Segoe UI',Arial,sans-serif;fill:#a9bfd7}.name{font:700 21px 'Segoe UI',Arial,sans-serif;fill:#f6f9ff}.body{font:400 14px 'Segoe UI',Arial,sans-serif;fill:#b7c9dc}.label{font:700 12px 'Segoe UI',Arial,sans-serif;fill:#84c9ff;letter-spacing:.5px}.edge{fill:none;stroke:#68a5ff;stroke-width:3;marker-end:url(#arrow)}.dash{stroke-dasharray:8 8}.node{fill:#142c48;stroke:#507aa3;stroke-width:1.5}.core{fill:#183d58;stroke:#4ed4df;stroke-width:2.5}.store{fill:#173b3e;stroke:#49bf9c;stroke-width:2}
+    </style>
+  </defs>
+  <rect width="1400" height="720" rx="22" fill="url(#bg)"/>
+  <text x="58" y="66" class="title">Continuous conformance · live truth and durable evidence</text>
+  <text x="58" y="94" class="sub">Independently runnable evaluation without coupling Relay acknowledgement to monitoring availability</text>
+
+  <g filter="url(#shadow)"><rect x="70" y="170" width="235" height="112" rx="18" class="node"/><text x="100" y="208" class="name">API</text><text x="100" y="237" class="body">Mission lifecycle · DSS</text><text x="100" y="260" class="body">Assignment outbox · readiness</text></g>
+  <g filter="url(#shadow)"><rect x="582" y="151" width="290" height="150" rx="22" class="core"/><text x="612" y="195" class="name">CONFORMANCE</text><text x="612" y="225" class="body">Evaluator · hysteresis · incidents</text><text x="612" y="248" class="body">Fenced leases · replay · outbox</text><text x="612" y="276" class="label">CONTINUOUS DATA PLANE</text></g>
+  <g filter="url(#shadow)"><rect x="1095" y="170" width="235" height="112" rx="18" class="node"/><text x="1125" y="208" class="name">REGISTRY</text><text x="1125" y="237" class="body">TTL live projection</text><text x="1125" y="260" class="body">Assignment + writer fences</text></g>
+
+  <path d="M305 220H568" class="edge"/><text x="438" y="205" text-anchor="middle" class="label">IMMUTABLE ASSIGNMENT</text>
+  <path d="M872 220H1081" class="edge"/><text x="975" y="205" text-anchor="middle" class="label">LIVE STATE · CAS</text>
+
+  <g filter="url(#shadow)"><rect x="70" y="430" width="210" height="102" rx="18" class="node"/><text x="100" y="469" class="name">AGENT WAL</text><text x="100" y="498" class="body">wal_id · sequence · frame</text></g>
+  <g filter="url(#shadow)"><rect x="342" y="430" width="210" height="102" rx="18" class="node"/><text x="372" y="469" class="name">RELAY</text><text x="372" y="498" class="body">Authenticate · normalize · batch</text></g>
+  <g filter="url(#shadow)"><rect x="614" y="430" width="210" height="102" rx="18" class="node"/><text x="644" y="469" class="name">INFLUXDB</text><text x="644" y="498" class="body">Online evidence · replay</text></g>
+  <g filter="url(#shadow)"><rect x="886" y="430" width="210" height="102" rx="18" class="store"/><text x="916" y="469" class="name">POSTGRES</text><text x="916" y="498" class="body">Assignments · incidents · state</text></g>
+  <g filter="url(#shadow)"><rect x="1158" y="430" width="172" height="102" rx="18" class="node"/><text x="1188" y="469" class="name">OPS</text><text x="1188" y="498" class="body">Operator truth</text></g>
+
+  <path d="M280 481H328" class="edge"/><path d="M552 481H600" class="edge"/>
+  <path d="M719 430V330H707V315" class="edge"/><text x="742" y="367" class="label">BOUNDED OVERLAP</text>
+  <path d="M872 265C980 300 992 354 992 416" class="edge"/><text x="1010" y="353" class="label">ATOMIC COMMIT</text>
+  <path d="M1212 282V416" class="edge dash"/><text x="1230" y="355" class="label">API COMPOSES</text>
+  <path d="M1096 481H1144" class="edge dash"/>
+
+  <g transform="translate(70 615)"><circle cx="8" cy="-5" r="7" fill="#4ed4df"/><text x="25" y="0" class="body">Live warning may precede durability, with explicit recording status</text></g>
+  <g transform="translate(720 615)"><circle cx="8" cy="-5" r="7" fill="#49bf9c"/><text x="25" y="0" class="body">PostgreSQL remains authoritative for evidence and recovery</text></g>
+  <path d="M72 653H1328" stroke="#42627f"/><text x="700" y="685" text-anchor="middle" class="sub">condition · monitoring freshness · recording durability remain independently observable</text>
+</svg>

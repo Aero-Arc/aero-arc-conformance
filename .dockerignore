@@ -1,0 +1,8 @@
+.git
+bin
+coverage
+benchmarks
+configs/config.yaml
+.env
+*.log
+docs/*.pdf

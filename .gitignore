@@ -1,0 +1,10 @@
+/bin/
+/coverage/
+/benchmarks/
+*.out
+*.log
+.env
+configs/config.yaml
+.idea/
+.vscode/
+.DS_Store
