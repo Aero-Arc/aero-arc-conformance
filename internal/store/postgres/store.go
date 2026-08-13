@@ -608,12 +608,16 @@ func (s *Store) CommitEvaluation(ctx context.Context, claim Claim, commit Evalua
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var revision uint64
-	err = tx.QueryRow(ctx, `UPDATE conformance_assignments SET evaluation_revision=evaluation_revision+1,next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND lifecycle_state IN ('active','ending') AND authority_from_unix_ns<=$7 AND $7<authority_until_unix_ns RETURNING evaluation_revision`, commit.NextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, commit.Evaluation.ObservedAt.UnixNano()).Scan(&revision)
+	var authorityFromUnixNS, authorityUntilUnixNS int64
+	err = tx.QueryRow(ctx, `UPDATE conformance_assignments SET evaluation_revision=evaluation_revision+1,next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND lifecycle_state IN ('active','ending') AND authority_from_unix_ns<=$7 AND $7<authority_until_unix_ns RETURNING evaluation_revision,authority_from_unix_ns,authority_until_unix_ns`, commit.NextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, commit.Evaluation.ObservedAt.UnixNano()).Scan(&revision, &authorityFromUnixNS, &authorityUntilUnixNS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrLeaseLost
 	}
 	if err != nil {
 		return fmt.Errorf("fence evaluation commit: %w", err)
+	}
+	if err = validateEvaluationWithinAuthority(commit.Evaluation, authorityFromUnixNS, authorityUntilUnixNS); err != nil {
+		return err
 	}
 	if err = writeEvaluation(ctx, tx, claim.Assignment, revision, commit.Evaluation, false, true); err != nil {
 		return err
@@ -652,13 +656,17 @@ func (s *Store) CommitHistoricalEvaluation(ctx context.Context, current Claim, h
 	}
 	var raw []byte
 	var revision uint64
+	var authorityFromUnixNS, authorityUntilUnixNS int64
 	observedUnixNS := commit.Evaluation.ObservedAt.UnixNano()
-	err = tx.QueryRow(ctx, `UPDATE conformance_assignments SET evaluation_revision=evaluation_revision+1,updated_at=now() WHERE assignment_id=$1 AND assignment_generation=$2 AND lifecycle_state='superseded' AND authority_from_unix_ns<=$3 AND $3<authority_until_unix_ns RETURNING specification,evaluation_revision`, current.Assignment.ID, historicalGeneration, observedUnixNS).Scan(&raw, &revision)
+	err = tx.QueryRow(ctx, `UPDATE conformance_assignments SET evaluation_revision=evaluation_revision+1,updated_at=now() WHERE assignment_id=$1 AND assignment_generation=$2 AND lifecycle_state='superseded' AND authority_from_unix_ns<=$3 AND $3<authority_until_unix_ns RETURNING specification,evaluation_revision,authority_from_unix_ns,authority_until_unix_ns`, current.Assignment.ID, historicalGeneration, observedUnixNS).Scan(&raw, &revision, &authorityFromUnixNS, &authorityUntilUnixNS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("historical generation does not authorize the observation: %w", ErrInvalidTransition)
 	}
 	if err != nil {
 		return fmt.Errorf("fence historical generation: %w", err)
+	}
+	if err = validateEvaluationWithinAuthority(commit.Evaluation, authorityFromUnixNS, authorityUntilUnixNS); err != nil {
+		return err
 	}
 	var historical domain.Assignment
 	if err = json.Unmarshal(raw, &historical); err != nil {
@@ -680,6 +688,49 @@ func validateEvaluationCommit(commit EvaluationCommit) error {
 	for _, transition := range commit.Evaluation.Transitions {
 		if transition.ObservedAt.IsZero() || !supportedUnixNanoseconds(transition.ObservedAt) || transition.ObservedAt.After(commit.Evaluation.ObservedAt) || transition.FrameID == "" || transition.OpeningFrameID == "" || transition.WALID == "" || transition.WALSequence > math.MaxInt64 {
 			return fmt.Errorf("evaluation transition is incomplete or beyond its watermark")
+		}
+	}
+	return nil
+}
+
+// validateEvaluationWithinAuthority prevents an overlap/replay batch from
+// attributing causal state to the wrong assignment generation. The final
+// watermark, every transition, and every retained state timestamp must all be
+// inside the same stored half-open authority interval.
+func validateEvaluationWithinAuthority(evaluation domain.Evaluation, authorityFromUnixNS, authorityUntilUnixNS int64) error {
+	if authorityUntilUnixNS <= authorityFromUnixNS {
+		return fmt.Errorf("assignment authority interval is invalid: %w", ErrInvalidTransition)
+	}
+	validateTimestamp := func(label string, value time.Time) error {
+		if value.IsZero() {
+			return nil
+		}
+		if !supportedUnixNanoseconds(value) || value.After(evaluation.ObservedAt) {
+			return fmt.Errorf("%s is invalid or beyond the evaluation watermark: %w", label, ErrInvalidTransition)
+		}
+		unixNS := value.UnixNano()
+		if unixNS < authorityFromUnixNS || unixNS >= authorityUntilUnixNS {
+			return fmt.Errorf("%s is outside assignment authority: %w", label, ErrInvalidTransition)
+		}
+		return nil
+	}
+	if err := validateTimestamp("evaluation watermark", evaluation.ObservedAt); err != nil {
+		return err
+	}
+	for index, transition := range evaluation.Transitions {
+		if err := validateTimestamp(fmt.Sprintf("transition %d timestamp", index), transition.ObservedAt); err != nil {
+			return err
+		}
+	}
+	for violation, state := range evaluation.State.Violations {
+		for label, value := range map[string]time.Time{
+			"first suspected": state.FirstSuspectedAt,
+			"opened":          state.OpenedAt,
+			"last observed":   state.LastObservedAt,
+		} {
+			if err := validateTimestamp(fmt.Sprintf("%s %s state timestamp", violation, label), value); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -720,8 +771,8 @@ func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignmen
 	for _, transition := range evaluation.Transitions {
 		incidentKey := string(transition.Violation)
 		incidentID := stableID("incident", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, transition.OpeningFrameID)
-		// Keep the v1 event identity stable across migration. Incident occurrence
-		// safety comes from the immutable incident_id conflict predicate below.
+		// The frame ID makes transition evidence stable across deterministic replay;
+		// the incident ID predicate below also fences recurrence identity.
 		eventID := stableID("event", assignment.ID, fmt.Sprint(assignment.Generation), incidentKey, string(transition.Transition), transition.FrameID)
 		if transition.Transition == domain.TransitionOpened {
 			err = tx.QueryRow(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details,opening_frame_id) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$5,$6,$7)
@@ -763,9 +814,9 @@ WHERE conformance_events.assignment_id=EXCLUDED.assignment_id
   AND conformance_events.frame_id=EXCLUDED.frame_id
   AND conformance_events.wal_id=EXCLUDED.wal_id
   AND conformance_events.wal_sequence=EXCLUDED.wal_sequence
-	AND (conformance_events.evidence_version=1 OR (
-	  conformance_events.deviation_m=EXCLUDED.deviation_m
-	  AND conformance_events.payload_sha256=EXCLUDED.payload_sha256))
+  AND conformance_events.evidence_version=2
+  AND conformance_events.deviation_m=EXCLUDED.deviation_m
+  AND conformance_events.payload_sha256=EXCLUDED.payload_sha256
 RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, transition.Transition, transition.Violation, transition.ObservedAt, transition.FrameID, transition.WALID, transition.WALSequence, revision, evidencePayload, eventHash, transition.DeviationM).Scan(&returnedID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("event %s conflicts with immutable evidence: %w", eventID, ErrMessageConflict)

@@ -8,14 +8,9 @@ package postgres_test
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -45,7 +40,6 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 		})
 	}
 	now := time.Now().UTC()
-	upgraded := seedVersionOneActive(t, ctx, dsn, now)
 	first, err := postgresstore.Open(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -56,15 +50,7 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	resolvedUpgrade, found, err := first.ResolveAssignmentAt(ctx, upgraded.ID, upgraded.EffectiveFrom)
-	if err != nil || !found || resolvedUpgrade.Assignment.Generation != upgraded.Generation || resolvedUpgrade.AuthorityFrom == nil || !resolvedUpgrade.AuthorityFrom.Equal(upgraded.EffectiveFrom) || resolvedUpgrade.AuthorityUntil == nil || !resolvedUpgrade.AuthorityUntil.Equal(upgraded.EffectiveUntil) {
-		t.Fatalf("v1 active assignment was not upgraded exactly: %#v found=%v err=%v", resolvedUpgrade, found, err)
-	}
-	if _, found, err = first.ResolveAssignmentAt(ctx, upgraded.ID, upgraded.EffectiveUntil); err != nil || found {
-		t.Fatalf("v1 authority remained open at its exclusive end: found=%v err=%v", found, err)
-	}
-	assertVersionOneWatermarkMigration(t, ctx, dsn, upgraded.ID)
-	assertVersionOneOccurrenceMigration(t, ctx, dsn, first, upgraded)
+	assertFreshSchema(t, ctx, dsn)
 
 	terminal := assignment(now, 1, 1)
 	terminal.ID = "assignment-terminal"
@@ -221,6 +207,33 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != candidate.Generation {
 		t.Fatalf("invalid-history claim=%#v err=%v", claims, err)
 	}
+	beforeInvalid := readEvaluationFootprint(t, ctx, dsn, base.ID, base.Generation, candidate.Generation)
+	invalidOverlap := historicalCommit
+	invalidOverlap.Evaluation.Transitions = append([]domain.IncidentTransition(nil), historicalCommit.Evaluation.Transitions...)
+	invalidOverlap.Evaluation.Transitions[0].ObservedAt = base.EffectiveFrom.Add(-time.Nanosecond)
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidOverlap); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("historical transition crossed authority start: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid transition consumed the current fence: %v", err)
+	}
+	invalidState := historicalCommit
+	invalidState.Evaluation.State = domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral: {Phase: domain.IncidentSuspected, FirstSuspectedAt: base.EffectiveFrom.Add(-time.Nanosecond), LastObservedAt: base.EffectiveFrom},
+	}}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidState); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("historical state crossed authority start: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid state consumed the current fence: %v", err)
+	}
+	invalidState.Evaluation.State.Violations[domain.ViolationLateral] = domain.IncidentState{Phase: domain.IncidentOpen, OpeningFrameID: "incident-open", OpenedAt: base.EffectiveFrom, LastObservedAt: cutover}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidState); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("historical state crossed exclusive authority end: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid upper-bound state consumed the current fence: %v", err)
+	}
 	invalidHistorical := historicalCommit
 	invalidHistorical.Evaluation.ObservedAt = cutover
 	invalidHistorical.Evaluation.FrameID = "wrong-interval-frame"
@@ -229,6 +242,30 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 	}
 	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
 		t.Fatalf("invalid history attempt consumed the current fence: %v", err)
+	}
+	if afterInvalid := readEvaluationFootprint(t, ctx, dsn, base.ID, base.Generation, candidate.Generation); afterInvalid != beforeInvalid {
+		t.Fatalf("rejected historical batches mutated durable state: before=%+v after=%+v", beforeInvalid, afterInvalid)
+	}
+	invalidLive := postgresstore.EvaluationCommit{Evaluation: domain.Evaluation{
+		Condition:  domain.ConditionNonConforming,
+		Monitoring: domain.MonitoringCurrent,
+		Recording:  domain.RecordingPending,
+		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
+		Transitions: []domain.IncidentTransition{{
+			Violation: domain.ViolationLateral, Transition: domain.TransitionOpened,
+			ObservedAt: cutover.Add(-time.Nanosecond), FrameID: "live-cross-boundary",
+			OpeningFrameID: "live-cross-boundary", WALID: "live-wal", WALSequence: 1,
+		}},
+		ObservedAt: cutover.Add(time.Microsecond), FrameID: "live-batch", WALID: "live-wal", WALSequence: 2,
+	}, NextEvaluationAt: time.Now().UTC()}
+	if err = second.CommitEvaluation(ctx, claims[0], invalidLive); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("live transition crossed authority start: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid live batch consumed the lease: %v", err)
+	}
+	if afterInvalid := readEvaluationFootprint(t, ctx, dsn, base.ID, base.Generation, candidate.Generation); afterInvalid != beforeInvalid {
+		t.Fatalf("rejected live batch mutated durable state: before=%+v after=%+v", beforeInvalid, afterInvalid)
 	}
 	afterAuthority := historicalCommit
 	afterAuthority.Evaluation.ObservedAt = candidate.EffectiveUntil
@@ -242,6 +279,61 @@ func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
 
 	assertRetroactiveCutoverFence(t, ctx, first, dsn, now)
 	assertConcurrentCommitCutoverFence(t, ctx, first, second, dsn, now)
+}
+
+func assertFreshSchema(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var count, version int
+	if err = conn.QueryRow(ctx, `SELECT count(*),max(version) FROM schema_migrations`).Scan(&count, &version); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || version != 1 {
+		t.Fatalf("fresh schema ledger count=%d version=%d", count, version)
+	}
+}
+
+type evaluationFootprint struct {
+	HistoricalRevision int
+	CurrentRevision    int
+	Checkpoints        int
+	Summaries          int
+	Incidents          int
+	Events             int
+	RegistryOutbox     int
+}
+
+func readEvaluationFootprint(t *testing.T, ctx context.Context, dsn, assignmentID string, historicalGeneration, currentGeneration uint64) evaluationFootprint {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var result evaluationFootprint
+	if err = conn.QueryRow(ctx, `SELECT
+	(SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$3),
+	(SELECT count(*) FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_outbox WHERE assignment_id=$1 AND assignment_generation=$2 AND destination='registry')`, assignmentID, historicalGeneration, currentGeneration).Scan(
+		&result.HistoricalRevision,
+		&result.CurrentRevision,
+		&result.Checkpoints,
+		&result.Summaries,
+		&result.Incidents,
+		&result.Events,
+		&result.RegistryOutbox,
+	); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func assertConcurrentCommitCutoverFence(t *testing.T, ctx context.Context, first, second *postgresstore.Store, dsn string, now time.Time) {
@@ -413,153 +505,6 @@ func assertHistoricalPersistence(t *testing.T, ctx context.Context, dsn, assignm
 	if historicalRevision != 2 || currentRevision != 0 || checkpoints != 2 || summaries != 1 || registryOutbox != 1 || incidents != 1 || events != 2 || incidentState != "resolved" || observedAt.Sub(evaluation.ObservedAt).Abs() >= time.Microsecond {
 		t.Fatalf("historical persistence revision=%d current_revision=%d checkpoints=%d summaries=%d registry_outbox=%d incidents=%d events=%d incident_state=%s observed_at=%s", historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, incidents, events, incidentState, observedAt)
 	}
-}
-
-func seedVersionOneActive(t *testing.T, ctx context.Context, dsn string, now time.Time) domain.Assignment {
-	t.Helper()
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close(ctx)
-	_, sourceFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate integration test source")
-	}
-	migration, err := os.ReadFile(filepath.Join(filepath.Dir(sourceFile), "migrations", "001_initial.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = conn.Exec(ctx, string(migration)); err != nil {
-		t.Fatal(err)
-	}
-	checksumBytes := sha256.Sum256(migration)
-	if _, err = conn.Exec(ctx, `INSERT INTO schema_migrations(version,checksum) VALUES(1,$1)`, hex.EncodeToString(checksumBytes[:])); err != nil {
-		t.Fatal(err)
-	}
-	value := assignment(now, 1, 1)
-	value.ID = "assignment-upgrade"
-	value.EffectiveFrom = now.Add(-time.Hour).Truncate(time.Second).Add(123456789 * time.Nanosecond)
-	value.EffectiveUntil = value.EffectiveFrom.Add(2 * time.Hour)
-	raw, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = conn.Exec(ctx, `INSERT INTO conformance_assignments(assignment_id,assignment_generation,aircraft_id,agent_id,flight_id,intent_id,intent_version,policy_version,lifecycle_state,specification,next_evaluation_at,evaluation_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,now(),1)`, value.ID, value.Generation, value.AircraftID, value.AgentID, value.FlightID, value.IntentID, value.IntentVersion, value.PolicyVersion, raw); err != nil {
-		t.Fatal(err)
-	}
-	openedAt := value.EffectiveFrom.Add(time.Second)
-	checkpointAt := openedAt.Add(time.Second + 123*time.Nanosecond)
-	legacyPayload := []byte(`{"legacy_batch_state":"recovering"}`)
-	legacyHash := sha256.Sum256(legacyPayload)
-	legacyViolations := []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical, domain.ViolationTemporal}
-	legacyStates := make(map[domain.ViolationType]domain.IncidentState, len(legacyViolations))
-	for index, violation := range legacyViolations {
-		openingFrame := legacyOpeningFrame(violation)
-		incidentID := testStableID("incident", value.ID, fmt.Sprint(value.Generation), string(violation), openingFrame)
-		eventID := testStableID("event", value.ID, fmt.Sprint(value.Generation), string(violation), string(domain.TransitionOpened), openingFrame)
-		if _, err = conn.Exec(ctx, `INSERT INTO conformance_incidents(incident_id,assignment_id,assignment_generation,incident_key,violation_type,state,severity,opened_at,last_observed_at,details) VALUES($1,$2,$3,$4,$4,'open','warning',$5,$6,$7)`, incidentID, value.ID, value.Generation, violation, openedAt, checkpointAt, legacyPayload); err != nil {
-			t.Fatal(err)
-		}
-		if _, err = conn.Exec(ctx, `INSERT INTO conformance_events(event_id,assignment_id,assignment_generation,incident_id,transition,violation_type,observed_at,frame_id,wal_id,wal_sequence,evaluation_revision,payload,payload_sha256) VALUES($1,$2,$3,$4,'opened',$5,$6,$7,'v1-wal',$8,1,$9,$10)`, eventID, value.ID, value.Generation, incidentID, violation, openedAt, openingFrame, index+1, legacyPayload, hex.EncodeToString(legacyHash[:])); err != nil {
-			t.Fatal(err)
-		}
-		legacyStates[violation] = domain.IncidentState{Phase: domain.IncidentRecovering, OpenedAt: openedAt, LastObservedAt: checkpointAt}
-	}
-	legacyState, err := json.Marshal(domain.EvaluatorState{Violations: legacyStates})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = conn.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,1,$3,'v1-wal',2,'v1-checkpoint',$4)`, value.ID, value.Generation, checkpointAt, legacyState); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = conn.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,frame_id,payload) VALUES($1,$2,1,'recovering','current','confirmed',$3,'v1-checkpoint','{}')`, value.ID, value.Generation, checkpointAt); err != nil {
-		t.Fatal(err)
-	}
-	return value
-}
-
-func assertVersionOneWatermarkMigration(t *testing.T, ctx context.Context, dsn, assignmentID string) {
-	t.Helper()
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close(ctx)
-	var observedAt time.Time
-	var observedUnixNS int64
-	if err = conn.QueryRow(ctx, `SELECT observed_at,observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=1`, assignmentID).Scan(&observedAt, &observedUnixNS); err != nil {
-		t.Fatal(err)
-	}
-	if want := observedAt.UnixMicro()*1000 + 999; observedUnixNS != want {
-		t.Fatalf("v1 watermark migration=%d want conservative microsecond end %d", observedUnixNS, want)
-	}
-}
-
-func assertVersionOneOccurrenceMigration(t *testing.T, ctx context.Context, dsn string, store *postgresstore.Store, assignment domain.Assignment) {
-	t.Helper()
-	checkpoint, found, err := store.GetReplayCheckpoint(ctx, assignment.ID, assignment.Generation, assignment.EffectiveUntil)
-	if err != nil || !found {
-		t.Fatalf("migrated checkpoint found=%v err=%v", found, err)
-	}
-	for _, violation := range []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical, domain.ViolationTemporal} {
-		state := checkpoint.State.Violations[violation]
-		if state.OpeningFrameID != legacyOpeningFrame(violation) || state.Phase != domain.IncidentRecovering {
-			t.Fatalf("migrated %s occurrence state=%#v", violation, state)
-		}
-	}
-	openingFrame := legacyOpeningFrame(domain.ViolationLateral)
-	claims, err := store.ClaimDueAssignments(ctx, "v1-recovery-worker", time.Minute, 10)
-	if err != nil || len(claims) != 1 || claims[0].Assignment.ID != assignment.ID {
-		t.Fatalf("migrated recovery claim=%#v err=%v", claims, err)
-	}
-	openedAt := assignment.EffectiveFrom.Add(time.Second)
-	resolvedAt := checkpoint.StateThroughAt.Add(time.Second)
-	evaluation := domain.Evaluation{
-		Condition:  domain.ConditionConforming,
-		Monitoring: domain.MonitoringCurrent,
-		Recording:  domain.RecordingPending,
-		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
-		Transitions: []domain.IncidentTransition{
-			{Violation: domain.ViolationLateral, Transition: domain.TransitionOpened, ObservedAt: openedAt, FrameID: openingFrame, OpeningFrameID: openingFrame, WALID: "v1-wal", WALSequence: 1},
-			{Violation: domain.ViolationLateral, Transition: domain.TransitionResolved, ObservedAt: resolvedAt, FrameID: "v2-resolution-frame", OpeningFrameID: openingFrame, WALID: "v1-wal", WALSequence: 3},
-		},
-		ObservedAt: resolvedAt, FrameID: "v2-recovered-batch", WALID: "v1-wal", WALSequence: 3,
-	}
-	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: time.Now().UTC().Add(time.Hour)}); err != nil {
-		t.Fatalf("resolve migrated occurrence: %v", err)
-	}
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close(ctx)
-	var incidents, events, legacyEvents, versionTwoEvents int
-	var incidentState, migratedOpeningFrame string
-	if err = conn.QueryRow(ctx, `SELECT
-	(SELECT count(*) FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=1),
-	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=1),
-	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=1 AND evidence_version=1),
-	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=1 AND evidence_version=2),
-	(SELECT state FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=1 AND incident_key='lateral_deviation'),
-	(SELECT opening_frame_id FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=1 AND incident_key='lateral_deviation')`, assignment.ID).Scan(&incidents, &events, &legacyEvents, &versionTwoEvents, &incidentState, &migratedOpeningFrame); err != nil {
-		t.Fatal(err)
-	}
-	if incidents != 3 || events != 4 || legacyEvents != 3 || versionTwoEvents != 1 || incidentState != "resolved" || migratedOpeningFrame != openingFrame {
-		t.Fatalf("migrated replay incidents=%d events=%d legacy=%d v2=%d state=%s opening=%s", incidents, events, legacyEvents, versionTwoEvents, incidentState, migratedOpeningFrame)
-	}
-}
-
-func legacyOpeningFrame(violation domain.ViolationType) string {
-	return "v1-" + string(violation) + "-opening-frame"
-}
-
-func testStableID(parts ...string) string {
-	h := sha256.New()
-	for _, part := range parts {
-		_, _ = fmt.Fprintf(h, "%d:%s", len(part), part)
-	}
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 func activate(t *testing.T, ctx context.Context, store *postgresstore.Store, value domain.Assignment, prefix string, effectiveAt time.Time) {
