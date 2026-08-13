@@ -49,6 +49,7 @@ func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observ
 	if observation.FrameID == "" || observation.AgentID == "" || observation.WALID == "" || observation.AircraftID != assignment.AircraftID || observation.AgentID != assignment.AgentID || observation.FlightID != assignment.FlightID || observation.IntentID != assignment.IntentID || observation.IntentVersion != assignment.IntentVersion || observation.ObservedAt.IsZero() || !validCoordinate(observation.Latitude, observation.Longitude) || (observation.AltitudeKnown && !finite(observation.AltitudeM)) {
 		return domain.Evaluation{}, fmt.Errorf("%w: observation identity does not match assignment", ErrInvalidInput)
 	}
+	causalFrom := earliestCausalTimestamp(previous, observation.ObservedAt)
 	cloned := domain.EvaluatorState{Violations: make(map[domain.ViolationType]domain.IncidentState, len(previous.Violations))}
 	for violation, state := range previous.Violations {
 		cloned.Violations[violation] = state
@@ -152,7 +153,7 @@ func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observ
 		condition = domain.ConditionUnknown
 	}
 	_ = now // freshness is assessed from the poll watermark, never event age during replay.
-	return domain.Evaluation{Condition: condition, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: cloned, Transitions: transitions, CausalFrom: observation.ObservedAt, ObservedAt: observation.ObservedAt, FrameID: observation.FrameID, WALID: observation.WALID, WALSequence: observation.WALSequence}, nil
+	return domain.Evaluation{Condition: condition, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: cloned, Transitions: transitions, CausalFrom: causalFrom, ObservedAt: observation.ObservedAt, FrameID: observation.FrameID, WALID: observation.WALID, WALSequence: observation.WALSequence}, nil
 }
 
 // AssessMonitoring evaluates dependency availability and telemetry silence on a
@@ -175,23 +176,13 @@ func (e *Evaluator) EvaluateBatch(assignment domain.Assignment, observations []d
 	if len(observations) == 0 {
 		return domain.Evaluation{}, fmt.Errorf("%w: empty observation batch", ErrInvalidInput)
 	}
-	causalFrom := observations[0].ObservedAt
-	for _, state := range previous.Violations {
-		if state.Phase == domain.IncidentClear || state.Phase == "" {
-			continue
-		}
-		for _, candidate := range []time.Time{state.FirstSuspectedAt, state.OpenedAt} {
-			if !candidate.IsZero() && candidate.Before(causalFrom) {
-				causalFrom = candidate
-			}
-		}
-	}
+	causalFrom := earliestCausalTimestamp(previous, observations[0].ObservedAt)
 	allTransitions := make([]domain.IncidentTransition, 0)
 	var result domain.Evaluation
 	var err error
 	for index, observation := range observations {
-		if index > 0 && observation.ObservedAt.Before(observations[index-1].ObservedAt) {
-			return domain.Evaluation{}, fmt.Errorf("%w: observation batch is not event-time ordered", ErrInvalidInput)
+		if index > 0 && observationBefore(observation, observations[index-1]) {
+			return domain.Evaluation{}, fmt.Errorf("%w: observation batch is not canonically ordered", ErrInvalidInput)
 		}
 		result, err = e.Evaluate(observation.ObservedAt, assignment, observation, previous)
 		if err != nil {
@@ -203,6 +194,39 @@ func (e *Evaluator) EvaluateBatch(assignment domain.Assignment, observations []d
 	result.Transitions = allTransitions
 	result.CausalFrom = causalFrom
 	return result, nil
+}
+
+func earliestCausalTimestamp(state domain.EvaluatorState, fallback time.Time) time.Time {
+	earliest := fallback
+	for _, incident := range state.Violations {
+		if incident.Phase == domain.IncidentClear || incident.Phase == "" {
+			continue
+		}
+		for _, candidate := range []time.Time{incident.FirstSuspectedAt, incident.OpenedAt} {
+			if !candidate.IsZero() && candidate.Before(earliest) {
+				earliest = candidate
+			}
+		}
+	}
+	return earliest
+}
+
+// observationBefore mirrors the Influx reader's canonical ordering. Evaluation
+// is hysteresis-sensitive, so callers may not permute equal-time frames.
+func observationBefore(a, b domain.Observation) bool {
+	if !a.ObservedAt.Equal(b.ObservedAt) {
+		return a.ObservedAt.Before(b.ObservedAt)
+	}
+	if a.AgentID != b.AgentID {
+		return a.AgentID < b.AgentID
+	}
+	if a.WALID != b.WALID {
+		return a.WALID < b.WALID
+	}
+	if a.WALSequence != b.WALSequence {
+		return a.WALSequence < b.WALSequence
+	}
+	return a.FrameID < b.FrameID
 }
 
 func (e *Evaluator) advance(v domain.ViolationType, state domain.IncidentState, breached bool, deviation float64, o domain.Observation) (domain.IncidentState, *domain.IncidentTransition) {

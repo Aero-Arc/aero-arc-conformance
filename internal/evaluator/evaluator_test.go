@@ -94,6 +94,15 @@ func TestEvaluateBatchTransitionsKeepOccurrenceAndOwnWALCursor(t *testing.T) {
 	if !cleared.CausalFrom.Equal(priorStart) {
 		t.Fatalf("cleared batch lost retained causal start: got %s want %s", cleared.CausalFrom, priorStart)
 	}
+	direct := mustEvaluate(t, e, resolved.ObservedAt, a, resolved, previous)
+	if !direct.CausalFrom.Equal(priorStart) {
+		t.Fatalf("single evaluation lost retained causal start: got %s want %s", direct.CausalFrom, priorStart)
+	}
+	equalTimeEarlier := observation(now, 50, 35.02, -97.02, 100)
+	equalTimeLater := observation(now, 51, 35.005, -97.005, 100)
+	if _, err = e.EvaluateBatch(a, []domain.Observation{equalTimeLater, equalTimeEarlier}, domain.EvaluatorState{}); err == nil {
+		t.Fatal("equal-time decreasing WAL sequence was accepted")
+	}
 }
 
 func TestEvaluatorDoesNotGuessAltitudeReference(t *testing.T) {

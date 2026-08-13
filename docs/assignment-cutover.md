@@ -67,6 +67,11 @@ timestamp against the same stored half-open authority interval. This prevents a
 batch that begins before cutover—but opens and resolves after it—from erasing
 the cross-generation input when its final state becomes clear.
 
+The evaluator accepts batches only in the telemetry reader's canonical event
+time, agent, WAL identity, WAL sequence, and frame order. Equal-time frames can
+change hysteresis outcomes, so their cursor order is validated rather than
+treated as interchangeable.
+
 Incident transitions carry the opening frame of their exact occurrence and the
 transition's own WAL cursor. Immutable event rows contain only that transition
 evidence, not mutable batch-final evaluator state. Replay can therefore move an
