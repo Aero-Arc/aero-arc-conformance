@@ -88,16 +88,16 @@ func New(host, token, database string, chunkSize, maxRows int) (*Reader, error) 
 	return NewWithRunner(&clientRunner{client: client}, chunkSize, maxRows)
 }
 
-// NewWithRunner constructs influx from the supplied configuration and dependencies.
+// NewWithRunner constructs an incremental telemetry reader over a query runner.
 //
 // Parameters:
-//   - runner: is the QueryRunner value supplied to NewWithRunner.
-//   - chunkSize: is the int value supplied to NewWithRunner.
-//   - maxRows: is the int value supplied to NewWithRunner.
+//   - runner: executes parameterized Influx queries and owns its close lifecycle.
+//   - chunkSize: caps aircraft IDs included in one SQL query.
+//   - maxRows: is the saturation boundary that prevents silent truncation.
 //
 // Returns:
-//   - result: is the *Reader value produced by NewWithRunner.
-//   - error: reports validation, dependency, cancellation, or persistence failures.
+//   - reader: is configured for bounded, chunked position reads.
+//   - error: reports a nil runner, non-positive chunk size, or non-positive row limit.
 func NewWithRunner(runner QueryRunner, chunkSize, maxRows int) (*Reader, error) {
 	if runner == nil || chunkSize < 1 || maxRows < 1 {
 		return nil, fmt.Errorf("reader runner, chunk size, and max rows are required")
@@ -124,6 +124,18 @@ type RowRejection struct {
 // ReadPositions returns a deterministic logical set for [start,end). It rejects
 // a saturated chunk rather than silently truncating; the worker must split the
 // time window and retry before advancing a checkpoint.
+//
+// Parameters:
+//   - ctx: controls query cancellation and deadlines.
+//   - aircraftIDs: selects assigned aircraft; blanks and duplicates are removed.
+//   - start: is the inclusive telemetry event-time boundary.
+//   - end: is the exclusive telemetry event-time boundary.
+//
+// Returns:
+//   - result: contains canonically ordered, frame-deduplicated observations and
+//     isolated malformed-row diagnostics.
+//   - error: reports an invalid window, missing WAL identity, query failure, or
+//     a saturated result that must be split before checkpoint advancement.
 func (r *Reader) ReadPositions(ctx context.Context, aircraftIDs []string, start, end time.Time) (ReadResult, error) {
 	ids := uniqueIDs(aircraftIDs)
 	if len(ids) == 0 {
