@@ -33,6 +33,14 @@ type Store struct{ pool *pgxpool.Pool }
 
 // Open connects to PostgreSQL, verifies connectivity, and applies pending
 // schema migrations before returning the store.
+//
+// Parameters:
+//   - ctx: controls pool creation, readiness, and migration cancellation.
+//   - dsn: identifies the PostgreSQL database and connection policy.
+//
+// Returns:
+//   - store: owns the ready connection pool and migrated schema.
+//   - error: reports DSN parsing, connection, readiness, or migration failure.
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -55,9 +63,18 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 }
 
 // Close releases the PostgreSQL connection pool.
+//
+// Close has no parameters or return value; callers must stop workers before
+// closing the shared store.
 func (s *Store) Close() { s.pool.Close() }
 
 // Ping verifies that PostgreSQL is reachable.
+//
+// Parameters:
+//   - ctx: controls the readiness probe deadline.
+//
+// Returns:
+//   - error: reports context cancellation or database unavailability.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 type ApplyDisposition string
@@ -76,6 +93,18 @@ type ApplyResult struct {
 // PrepareAssignment stores a candidate generation without changing the
 // currently authoritative assignment. A prepared generation must be armed and
 // explicitly cut over before workers may evaluate it.
+//
+// Parameters:
+//   - ctx: controls the serializable assignment transaction.
+//   - source: namespaces the durable inbox producer.
+//   - messageID: is the producer's idempotency key.
+//   - messageType: participates in full-envelope conflict detection.
+//   - assignment: is the immutable candidate generation and specification.
+//
+// Returns:
+//   - result: distinguishes applied, idempotent, and stale delivery outcomes.
+//   - error: reports invalid identity/specification, conflicting message reuse,
+//     immutable-identity changes, or transaction failure.
 func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
 	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(messageType) == "" || strings.TrimSpace(assignment.ID) == "" || assignment.Generation == 0 || assignment.Generation > math.MaxInt64 || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) {
 		return ApplyResult{}, fmt.Errorf("assignment envelope is invalid")
@@ -205,6 +234,17 @@ func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messag
 
 // ApplyAssignment is retained for the initial internal callers. Its semantics
 // are preparation-only; it never supersedes the current authority.
+//
+// Parameters:
+//   - ctx: controls the preparation transaction.
+//   - source: namespaces the durable inbox producer.
+//   - messageID: is the producer's idempotency key.
+//   - messageType: participates in full-envelope conflict detection.
+//   - assignment: is the immutable candidate generation and specification.
+//
+// Returns:
+//   - result: is exactly the result of PrepareAssignment.
+//   - error: is exactly the error contract of PrepareAssignment.
 func (s *Store) ApplyAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
 	return s.PrepareAssignment(ctx, source, messageID, messageType, assignment)
 }
@@ -222,12 +262,34 @@ type lifecycleCommand struct {
 
 // ArmAssignment marks a prepared generation ready for cutover. It does not
 // grant authority and does not make the generation claimable by evaluators.
+//
+// Parameters:
+//   - ctx: controls the lifecycle transaction.
+//   - source: namespaces the lifecycle command producer.
+//   - messageID: is the producer's idempotency key.
+//   - assignmentID: identifies the logical assignment.
+//   - generation: identifies the prepared candidate to arm.
+//
+// Returns:
+//   - result: contains the armed record and applied/idempotent disposition.
+//   - error: reports invalid, stale, conflicting, or out-of-order transitions.
 func (s *Store) ArmAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64) (LifecycleResult, error) {
 	return s.transitionCandidate(ctx, source, messageID, "assignment_armed", assignmentID, generation, domain.AssignmentArmed)
 }
 
 // CancelCandidate discards a received or armed replacement without disturbing
 // the active generation.
+//
+// Parameters:
+//   - ctx: controls the lifecycle transaction.
+//   - source: namespaces the lifecycle command producer.
+//   - messageID: is the producer's idempotency key.
+//   - assignmentID: identifies the logical assignment.
+//   - generation: identifies the candidate to cancel.
+//
+// Returns:
+//   - result: contains the cancelled record and applied/idempotent disposition.
+//   - error: reports invalid, stale, conflicting, or out-of-order transitions.
 func (s *Store) CancelCandidate(ctx context.Context, source, messageID, assignmentID string, generation uint64) (LifecycleResult, error) {
 	return s.transitionCandidate(ctx, source, messageID, "assignment_cancelled", assignmentID, generation, domain.AssignmentCancelled)
 }
@@ -306,6 +368,19 @@ func (s *Store) transitionCandidate(ctx context.Context, source, messageID, mess
 // interval and activates an armed candidate at effectiveAt. effectiveAt is an
 // event-time boundary; late observations before it continue to resolve to the
 // superseded generation.
+//
+// Parameters:
+//   - ctx: controls the fenced cutover transaction.
+//   - source: namespaces the lifecycle command producer.
+//   - messageID: is the producer's idempotency key.
+//   - assignmentID: identifies the logical assignment.
+//   - generation: identifies the armed candidate becoming authoritative.
+//   - effectiveAt: is the exclusive old/inclusive new event-time boundary.
+//
+// Returns:
+//   - result: contains the newly active record and command disposition.
+//   - error: reports invalid/stale lifecycle, inbox conflict, unsafe retroactive
+//     cutover across committed evidence, or transaction failure.
 func (s *Store) CutoverAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64, effectiveAt time.Time) (LifecycleResult, error) {
 	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(assignmentID) == "" || generation == 0 || generation > math.MaxInt64 || effectiveAt.IsZero() {
 		return LifecycleResult{}, fmt.Errorf("assignment cutover command is invalid")
@@ -415,6 +490,16 @@ func (s *Store) CutoverAssignment(ctx context.Context, source, messageID, assign
 
 // ResolveAssignmentAt returns the immutable generation authoritative for an
 // observation timestamp. Historical superseded generations remain resolvable.
+//
+// Parameters:
+//   - ctx: controls the database lookup.
+//   - assignmentID: identifies the logical assignment history.
+//   - observedAt: is the event time being attributed.
+//
+// Returns:
+//   - record: contains the one half-open authority interval matching observedAt.
+//   - found: is false when no generation authorizes that event time.
+//   - error: reports unsupported timestamps or database/decoding failure.
 func (s *Store) ResolveAssignmentAt(ctx context.Context, assignmentID string, observedAt time.Time) (domain.AssignmentRecord, bool, error) {
 	if !supportedUnixNanoseconds(observedAt) {
 		return domain.AssignmentRecord{}, false, fmt.Errorf("observation is outside the supported nanosecond timestamp range")
@@ -525,6 +610,16 @@ type Claim struct {
 
 // ClaimDueAssignments atomically leases due active assignments to workerID,
 // incrementing each lease generation as a takeover fence.
+//
+// Parameters:
+//   - ctx: controls the claim transaction.
+//   - workerID: identifies the evaluator replica acquiring ownership.
+//   - lease: defines the PostgreSQL-clock ownership interval.
+//   - limit: caps assignments claimed in one transaction.
+//
+// Returns:
+//   - claims: contain assignment, lease generation, expiry, and expected revision.
+//   - error: reports invalid arguments, database failure, or specification decoding.
 func (s *Store) ClaimDueAssignments(ctx context.Context, workerID string, lease time.Duration, limit int) ([]Claim, error) {
 	if workerID == "" || lease <= 0 || limit < 1 {
 		return nil, fmt.Errorf("claim arguments are invalid")
@@ -560,6 +655,15 @@ SELECT specification,lease_generation,lease_until,evaluation_revision FROM claim
 
 // RenewAssignmentLease extends an unexpired lease only when the caller still
 // owns the exact assignment and lease generation.
+//
+// Parameters:
+//   - ctx: controls the renewal statement.
+//   - claim: carries assignment, worker, and lease-generation ownership fences.
+//   - extension: is the new positive duration measured from PostgreSQL time.
+//
+// Returns:
+//   - error: reports a non-positive extension, database failure, or ErrLeaseLost
+//     when ownership, generation, lifecycle, or expiry no longer matches.
 func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension time.Duration) error {
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
@@ -591,6 +695,17 @@ type ReplayCheckpoint struct {
 // GetReplayCheckpoint returns the newest retained evaluator snapshot at or
 // before a replay boundary. A takeover restores this state, then deterministically
 // replays the suffix after the returned cursor.
+//
+// Parameters:
+//   - ctx: controls the checkpoint query.
+//   - assignmentID: identifies the logical assignment.
+//   - generation: selects one immutable authority generation.
+//   - atOrBefore: is the latest acceptable checkpoint event-time watermark.
+//
+// Returns:
+//   - checkpoint: contains evaluator state and its stable telemetry cursor.
+//   - found: is false when no retained snapshot precedes the boundary.
+//   - error: reports database or evaluator-state decoding failure.
 func (s *Store) GetReplayCheckpoint(ctx context.Context, assignmentID string, generation uint64, atOrBefore time.Time) (ReplayCheckpoint, bool, error) {
 	var checkpoint ReplayCheckpoint
 	var state []byte
@@ -609,6 +724,15 @@ func (s *Store) GetReplayCheckpoint(ctx context.Context, assignmentID string, ge
 
 // CommitEvaluation atomically records a live evaluation behind the assignment,
 // lease-generation, evaluation-revision, and authority-interval fences.
+//
+// Parameters:
+//   - ctx: controls the atomic evaluation transaction.
+//   - claim: proves current worker ownership and expected evaluation revision.
+//   - commit: contains final state, immutable transitions, watermark, and next due time.
+//
+// Returns:
+//   - error: reports incomplete evidence, authority violation, ErrLeaseLost,
+//     stale live watermark, immutable-event conflict, or transaction failure.
 func (s *Store) CommitEvaluation(ctx context.Context, claim Claim, commit EvaluationCommit) error {
 	if err := validateEvaluationCommit(commit); err != nil {
 		return err
@@ -643,6 +767,16 @@ func (s *Store) CommitEvaluation(ctx context.Context, claim Claim, commit Evalua
 // superseded generation while fencing the transaction with the lease of the
 // currently active generation. It never revives the historical worker and
 // never publishes the historical summary as the current Registry projection.
+//
+// Parameters:
+//   - ctx: controls the atomic reconciliation transaction.
+//   - current: proves current-generation worker and lease ownership.
+//   - historicalGeneration: selects an older superseded authority interval.
+//   - commit: contains the rebuilt historical state and immutable transitions.
+//
+// Returns:
+//   - error: reports invalid generation/evidence, ErrLeaseLost, authority
+//     violation, immutable-event conflict, or transaction failure.
 func (s *Store) CommitHistoricalEvaluation(ctx context.Context, current Claim, historicalGeneration uint64, commit EvaluationCommit) error {
 	if err := validateEvaluationCommit(commit); err != nil {
 		return err

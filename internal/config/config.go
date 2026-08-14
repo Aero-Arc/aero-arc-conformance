@@ -26,6 +26,13 @@ type Config struct {
 }
 type Duration time.Duration
 
+// UnmarshalYAML parses a YAML duration string into Duration.
+//
+// Parameters:
+//   - node: is the *yaml.Node value supplied to UnmarshalYAML.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	value, err := time.ParseDuration(node.Value)
 	if err != nil {
@@ -34,6 +41,11 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	*d = Duration(value)
 	return nil
 }
+
+// Value returns the wrapped standard-library duration.
+//
+// Returns:
+//   - result: is the time.Duration value produced by Value.
 func (d Duration) Value() time.Duration { return time.Duration(d) }
 
 type Service struct {
@@ -72,9 +84,22 @@ type Logging struct {
 	Format string `yaml:"format"`
 }
 
+// Default returns the Conformance service's baseline development configuration.
+//
+// Returns:
+//   - result: is the Config value produced by Default.
 func Default() Config {
 	return Config{Service: Service{ManagementAddress: ":2112", ShutdownTimeout: Duration(15 * time.Second)}, Influx: Influx{PollInterval: Duration(time.Second), OverlapWindow: Duration(30 * time.Second), SettleDelay: Duration(2 * time.Second), AircraftBatchSize: 100, MaxRows: 10000}, Worker: Worker{LeaseDuration: Duration(30 * time.Second), RenewInterval: Duration(10 * time.Second), ClaimBatchSize: 20}, Policy: Policy{Version: "standard-v1", HorizontalToleranceM: 5, VerticalToleranceM: 3, OpenAfterSamples: 3, RecoverAfterSamples: 3, TelemetryFreshness: Duration(15 * time.Second)}, Logging: Logging{Level: "info", Format: "json"}}
 }
+
+// Load reads, decodes, and validates Conformance configuration from a YAML file.
+//
+// Parameters:
+//   - path: is the string value supplied to Load.
+//
+// Returns:
+//   - result: is the Config value produced by Load.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func Load(path string) (Config, error) {
 	cfg := Default()
 	contents, err := os.ReadFile(path)
@@ -98,6 +123,11 @@ func Load(path string) (Config, error) {
 	}
 	return cfg, nil
 }
+
+// Validate validates Config for required fields, supported values, and safety constraints.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Service.ManagementAddress) == "" || c.Service.ShutdownTimeout <= 0 {
 		return fmt.Errorf("service management address and positive shutdown timeout are required")

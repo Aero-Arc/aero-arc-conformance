@@ -113,6 +113,12 @@ type AssignmentRecord struct {
 
 // Authorizes reports whether observedAt belongs to this record's half-open
 // authority interval.
+//
+// Parameters:
+//   - observedAt: is the telemetry event time being attributed.
+//
+// Returns:
+//   - authorized: is true only for authority_from <= observedAt < authority_until.
 func (r AssignmentRecord) Authorizes(observedAt time.Time) bool {
 	return r.AuthorityFrom != nil && !observedAt.Before(*r.AuthorityFrom) && (r.AuthorityUntil == nil || observedAt.Before(*r.AuthorityUntil))
 }

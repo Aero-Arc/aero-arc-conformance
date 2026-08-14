@@ -27,6 +27,10 @@ type Policy struct {
 }
 
 // Validate reports whether the policy is complete and safe to evaluate.
+//
+// Returns:
+//   - error: reports a missing version, non-finite/negative tolerance,
+//     non-positive hysteresis count, or non-positive freshness interval.
 func (p Policy) Validate() error {
 	if p.Version == "" || !finiteNonnegative(p.HorizontalToleranceM) || !finiteNonnegative(p.VerticalToleranceM) || p.OpenAfterSamples < 1 || p.RecoverAfterSamples < 1 || p.TelemetryFreshness <= 0 {
 		return fmt.Errorf("%w: incomplete evaluator policy", ErrInvalidInput)
@@ -37,6 +41,13 @@ func (p Policy) Validate() error {
 type Evaluator struct{ policy Policy }
 
 // New constructs an evaluator after validating policy.
+//
+// Parameters:
+//   - policy: defines geometry tolerances, hysteresis, and telemetry freshness.
+//
+// Returns:
+//   - evaluator: is immutable and safe for independent evaluation calls.
+//   - error: reports an invalid policy.
 func New(policy Policy) (*Evaluator, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
@@ -46,6 +57,16 @@ func New(policy Policy) (*Evaluator, error) {
 
 // Evaluate applies one observation to previous evaluator state and returns the
 // resulting condition, incident state, and immutable transitions.
+//
+// Parameters:
+//   - now: is reserved for timer-based policy; containment uses event time.
+//   - assignment: is the exact generation and 4D authority being monitored.
+//   - observation: is one attributed, WAL-identified position observation.
+//   - previous: is the evaluator snapshot immediately preceding the observation.
+//
+// Returns:
+//   - evaluation: contains cloned next state, condition, and ordered transitions.
+//   - error: reports invalid assignment/policy data or mismatched observation identity.
 func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observation domain.Observation, previous domain.EvaluatorState) (domain.Evaluation, error) {
 	if err := validateAssignment(assignment, e.policy); err != nil {
 		return domain.Evaluation{}, err
@@ -163,6 +184,14 @@ func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observ
 // AssessMonitoring evaluates dependency availability and telemetry silence on a
 // wall-clock timer. It is deliberately separate from event-time containment so
 // historical replay cannot manufacture a telemetry-loss incident.
+//
+// Parameters:
+//   - now: is the wall-clock assessment time.
+//   - latestArrival: is when usable telemetry most recently arrived.
+//   - dependencyAvailable: reports whether the telemetry dependency can be queried.
+//
+// Returns:
+//   - status: is unavailable, stale, or current independently of containment.
 func (e *Evaluator) AssessMonitoring(now, latestArrival time.Time, dependencyAvailable bool) domain.MonitoringStatus {
 	if !dependencyAvailable {
 		return domain.MonitoringUnavailable
@@ -176,6 +205,15 @@ func (e *Evaluator) AssessMonitoring(now, latestArrival time.Time, dependencyAva
 // EvaluateBatch applies an event-time ordered suffix and preserves every
 // transition produced inside the batch. Callers must never keep only the final
 // sample's transitions: an incident may open and resolve within one poll.
+//
+// Parameters:
+//   - assignment: is the exact generation and 4D authority being monitored.
+//   - observations: are canonically ordered observations for that assignment.
+//   - previous: is the retained evaluator snapshot before the suffix.
+//
+// Returns:
+//   - evaluation: contains final state plus every transition emitted in the batch.
+//   - error: reports an empty/out-of-order batch or an invalid observation.
 func (e *Evaluator) EvaluateBatch(assignment domain.Assignment, observations []domain.Observation, previous domain.EvaluatorState) (domain.Evaluation, error) {
 	if len(observations) == 0 {
 		return domain.Evaluation{}, fmt.Errorf("%w: empty observation batch", ErrInvalidInput)
