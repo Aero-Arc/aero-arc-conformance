@@ -61,13 +61,15 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	return a, nil
 }
 
-// Run runs App until completion, cancellation, or a terminal error.
+// Run serves the management endpoint until context cancellation or a terminal
+// HTTP server failure. Cancellation performs graceful shutdown and returns the
+// shutdown result rather than the context cancellation error.
 //
 // Parameters:
 //   - ctx: controls cancellation and deadlines for the operation.
 //
 // Returns:
-//   - error: reports validation, dependency, cancellation, or persistence failures.
+//   - error: reports graceful-shutdown/close failure or a wrapped ListenAndServe failure.
 func (a *App) Run(ctx context.Context) error {
 	errors := make(chan error, 1)
 	go func() {
