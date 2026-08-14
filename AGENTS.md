@@ -90,3 +90,10 @@ alone is not meaningful coverage.
 - Add MPL 2.0 headers to Go source files.
 - Update design/configuration docs whenever a contract or invariant changes.
 - Commits must include a matching `Signed-off-by` line for DCO.
+- Every exported handwritten Go function or method has a lint-valid Go doc
+  comment beginning with its exact identifier. For evaluator, lease, replay,
+  persistence, and lifecycle APIs, include readable `Parameters:` and
+  `Returns:` sections that explain fences, authority windows, idempotency, and
+  expected errors; do not settle for a restatement of the signature.
+- Generated artifacts retain generator-owned comments and are never hand-edited
+  solely to satisfy documentation lint.

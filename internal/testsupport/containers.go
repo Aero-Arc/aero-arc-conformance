@@ -34,6 +34,14 @@ type Dependency struct {
 	name      string
 }
 
+// Shutdown stops Dependency and releases its owned resources.
+//
+// Parameters:
+//   - failed: indicates whether diagnostics for a failed test should be emitted.
+//   - output: receives encoded output or diagnostic details.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (d *Dependency) Shutdown(failed bool, output io.Writer) error {
 	if d == nil || d.container == nil {
 		return nil
@@ -58,6 +66,15 @@ type Postgres struct {
 	Dependency *Dependency
 }
 
+// StartPostgres starts a pinned PostGIS Testcontainer, waits for SQL readiness,
+// and returns dynamically mapped connection details with bounded cleanup.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//
+// Returns:
+//   - result: is the *Postgres value produced by StartPostgres.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func StartPostgres(ctx context.Context) (*Postgres, error) {
 	container, err := testcontainers.Run(ctx, PostgresImage, testcontainers.WithExposedPorts("5432/tcp"), testcontainers.WithEnv(map[string]string{"POSTGRES_DB": "conformance", "POSTGRES_USER": "conformance", "POSTGRES_PASSWORD": "conformance"}), testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(90*time.Second)))
 	if err != nil {
@@ -103,6 +120,15 @@ type Influx struct {
 	Dependency            *Dependency
 }
 
+// StartInflux starts a pinned InfluxDB Core Testcontainer, provisions the test
+// database, and returns dynamically mapped client settings with bounded cleanup.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//
+// Returns:
+//   - result: is the *Influx value produced by StartInflux.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func StartInflux(ctx context.Context) (*Influx, error) {
 	container, err := testcontainers.Run(ctx, InfluxImage, testcontainers.WithExposedPorts("8181/tcp"), testcontainers.WithCmd("influxdb3", "serve", "--node-id=conformance-integration", "--object-store=memory", "--without-auth"), testcontainers.WithWaitStrategy(wait.ForHTTP("/health").WithPort("8181/tcp").WithStartupTimeout(90*time.Second)))
 	if err != nil {

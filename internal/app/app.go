@@ -28,6 +28,16 @@ type App struct {
 	ready  atomic.Bool
 }
 
+// New constructs app from the supplied configuration and dependencies.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - cfg: provides the configuration values used to initialize or execute the operation.
+//   - log: is the *slog.Logger value supplied to New.
+//
+// Returns:
+//   - result: is the *App value produced by New.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
 	store, err := postgresstore.Open(ctx, cfg.Postgres.URL)
 	if err != nil {
@@ -50,6 +60,14 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	a.ready.Store(true)
 	return a, nil
 }
+
+// Run runs App until completion, cancellation, or a terminal error.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (a *App) Run(ctx context.Context) error {
 	errors := make(chan error, 1)
 	go func() {
@@ -79,6 +97,11 @@ func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ready\n"))
 }
+
+// Shutdown stops App and releases its owned resources.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (a *App) Shutdown() error {
 	a.ready.Store(false)
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Service.ShutdownTimeout.Value())

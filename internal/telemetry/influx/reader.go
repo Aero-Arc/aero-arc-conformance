@@ -34,6 +34,16 @@ type QueryRunner interface {
 
 type clientRunner struct{ client *influxdb3.Client }
 
+// Query queries clientRunner with the supplied statement and parameters.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - query: is the string value supplied to Query.
+//   - params: is the map[string]any value supplied to Query.
+//
+// Returns:
+//   - result: is the []map[string]any value produced by Query.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (r *clientRunner) Query(ctx context.Context, query string, params map[string]any) ([]map[string]any, error) {
 	iterator, err := r.client.QueryWithParameters(ctx, query, params)
 	if err != nil {
@@ -45,6 +55,11 @@ func (r *clientRunner) Query(ctx context.Context, query string, params map[strin
 	}
 	return rows, iterator.Err()
 }
+
+// Close releases resources owned by clientRunner and completes any required shutdown work.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (r *clientRunner) Close() error { return r.client.Close() }
 
 type Reader struct {
@@ -53,6 +68,18 @@ type Reader struct {
 	maxRows   int
 }
 
+// New constructs influx from the supplied configuration and dependencies.
+//
+// Parameters:
+//   - host: locates the external dependency used by the operation.
+//   - token: provides authentication material for the dependency.
+//   - database: locates the external dependency used by the operation.
+//   - chunkSize: is the int value supplied to New.
+//   - maxRows: is the int value supplied to New.
+//
+// Returns:
+//   - result: is the *Reader value produced by New.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func New(host, token, database string, chunkSize, maxRows int) (*Reader, error) {
 	client, err := influxdb3.New(influxdb3.ClientConfig{Host: host, Token: token, Database: database})
 	if err != nil {
@@ -60,12 +87,28 @@ func New(host, token, database string, chunkSize, maxRows int) (*Reader, error) 
 	}
 	return NewWithRunner(&clientRunner{client: client}, chunkSize, maxRows)
 }
+
+// NewWithRunner constructs influx from the supplied configuration and dependencies.
+//
+// Parameters:
+//   - runner: is the QueryRunner value supplied to NewWithRunner.
+//   - chunkSize: is the int value supplied to NewWithRunner.
+//   - maxRows: is the int value supplied to NewWithRunner.
+//
+// Returns:
+//   - result: is the *Reader value produced by NewWithRunner.
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func NewWithRunner(runner QueryRunner, chunkSize, maxRows int) (*Reader, error) {
 	if runner == nil || chunkSize < 1 || maxRows < 1 {
 		return nil, fmt.Errorf("reader runner, chunk size, and max rows are required")
 	}
 	return &Reader{runner: runner, chunkSize: chunkSize, maxRows: maxRows}, nil
 }
+
+// Close releases resources owned by Reader and completes any required shutdown work.
+//
+// Returns:
+//   - error: reports validation, dependency, cancellation, or persistence failures.
 func (r *Reader) Close() error { return r.runner.Close() }
 
 type ReadResult struct {
