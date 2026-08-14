@@ -27,6 +27,8 @@ interrupt Relay telemetry acknowledgement or storage.
 - Numbered PostgreSQL migrations for assignments, inbox, fenced leases,
   checkpoints, incidents, immutable transition events, summaries, and outbox.
 - Atomic assignment application and atomic fenced evaluation commits.
+- Blue-green assignment preparation: current and armed generations coexist,
+  then an explicit event-time cutover atomically transfers authority.
 - Forward-contract InfluxDB 3 reader with bounded aircraft batches, time
   windows, stable-frame deduplication, strict decoding, and overflow rejection.
 - Liveness, PostgreSQL-aware readiness, baseline Prometheus process metrics,
@@ -62,6 +64,7 @@ Management endpoints default to:
 ## Read next
 
 - [Conformance design](docs/conformance-design.md)
+- [Blue-green assignment cutover](docs/assignment-cutover.md)
 - [Development and validation](docs/development.md)
 - [Configuration](docs/configuration.md)
 - [Deployment](docs/deployment.md)

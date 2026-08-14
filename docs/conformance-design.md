@@ -50,6 +50,13 @@ Relay writes telemetry independently. Conformance cannot enter Relay's ACK path.
 This is a saga, not a distributed transaction. Every stage must be idempotent,
 observable, and reconcilable.
 
+Replacement intents use the same lifecycle as a blue-green deployment. The
+current generation stays authoritative and claimable while a higher generation
+is received and armed. The API emits the cutover only after its local intent
+version and DSS publication outcome are durably authoritative. Conformance then
+closes the prior authority interval and activates the candidate in one database
+transaction. See [Blue-green assignment cutover](assignment-cutover.md).
+
 ## Telemetry contract and cursor
 
 The merged Relay table is `aircraft_telemetry`. `agent_id`, `frame_id`,
@@ -141,6 +148,22 @@ inserts a Registry outbox item in one transaction.
 Assignment generation prevents an obsolete mission from returning. Lease
 generation prevents a paused evaluator from writing after takeover. Evaluation
 revision orders committed results and Registry projection delivery.
+
+Prepared and armed generations coexist with the current generation but have no
+authority interval and cannot be claimed. Authority intervals are half-open, so
+an observation exactly at cutover belongs only to the replacement. A cancelled
+candidate never affects the current assignment. A newer candidate may supersede
+an older candidate, but preparation alone never supersedes current authority.
+Every current interval ends at the immutable assignment `effective_until`.
+Delayed observations for a superseded interval are committed as historical
+reconciliation behind the current generation's lease; they update only the
+historical generation and never enqueue a current Registry projection.
+Cutover rejects a boundary at or before the current generation's exact durable
+evaluation watermark, because previously delivered live evidence cannot be
+silently reassigned. Incident occurrence identity and transition-local WAL
+cursors let bounded replay preserve immutable evidence while revising the
+current resolution pointer. General replay that removes or merges prior
+transitions still requires an explicit replay range and active-event projection.
 
 ## Worker death and reclaim
 

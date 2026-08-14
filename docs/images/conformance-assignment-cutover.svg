@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+  <title id="title">Blue-green conformance assignment cutover</title>
+  <desc id="desc">Generation seven remains authoritative while generation eight is prepared and armed. An atomic cutover closes generation seven's authority interval and activates generation eight. Late telemetry is routed by observation time.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0b1220"/><stop offset="1" stop-color="#111c31"/></linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#2563eb"/><stop offset="1" stop-color="#38bdf8"/></linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#059669"/><stop offset="1" stop-color="#34d399"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-opacity=".28"/></filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0l10 5-10 5z" fill="#94a3b8"/></marker>
+    <style>
+      text{font-family:Inter,ui-sans-serif,system-ui,sans-serif;fill:#e5edf8}.muted{fill:#94a3b8}.label{font-size:15px;font-weight:700;letter-spacing:.08em}.body{font-size:17px}.small{font-size:14px}.title{font-size:30px;font-weight:750}.card{filter:url(#shadow)}
+    </style>
+  </defs>
+  <rect width="1200" height="680" rx="28" fill="url(#bg)"/>
+  <text x="64" y="64" class="title">Operational intent replacement without an authority gap</text>
+  <text x="64" y="94" class="body muted">Prepare both generations. Authorize exactly one at every event timestamp.</text>
+
+  <text x="70" y="158" class="label" fill="#7dd3fc">CURRENT · GENERATION 7</text>
+  <rect x="64" y="176" width="420" height="154" rx="22" fill="#102a4c" stroke="#38bdf8" stroke-width="2" class="card"/>
+  <circle cx="104" cy="217" r="14" fill="#38bdf8"/><text x="132" y="224" class="body">ACTIVE + CLAIMABLE</text>
+  <text x="104" y="264" class="body">Intent version 12</text>
+  <text x="104" y="294" class="small muted">Authority: [from₇, cutover)</text>
+
+  <text x="716" y="158" class="label" fill="#6ee7b7">CANDIDATE · GENERATION 8</text>
+  <rect x="710" y="176" width="426" height="154" rx="22" fill="#0d332c" stroke="#34d399" stroke-width="2" class="card"/>
+  <circle cx="750" cy="217" r="14" fill="#34d399"/><text x="778" y="224" class="body">RECEIVED → ARMED</text>
+  <text x="750" y="264" class="body">Intent version 13</text>
+  <text x="750" y="294" class="small muted">No authority · never claimable</text>
+
+  <path d="M494 250 C570 250 628 250 700 250" fill="none" stroke="#94a3b8" stroke-width="3" stroke-dasharray="8 8" marker-end="url(#arrow)"/>
+  <text x="520" y="229" class="small muted">prepare + validate</text>
+
+  <rect x="390" y="376" width="420" height="98" rx="49" fill="url(#green)" class="card"/>
+  <text x="600" y="414" text-anchor="middle" class="label" fill="#041912">ATOMIC CUTOVER</text>
+  <text x="600" y="444" text-anchor="middle" class="body" fill="#041912">effective_at = authoritative boundary</text>
+  <path d="M274 340 C310 395 342 414 378 423" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M926 340 C890 395 858 414 822 423" fill="none" stroke="#94a3b8" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="64" y="526" width="1072" height="96" rx="20" fill="#17233a" stroke="#334155"/>
+  <text x="94" y="563" class="label">EVENT-TIME ROUTING</text>
+  <text x="94" y="595" class="body">observed_at &lt; cutover → generation 7</text>
+  <text x="617" y="595" class="body">observed_at ≥ cutover → generation 8</text>
+  <path d="M560 574h36" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="600" y="650" text-anchor="middle" class="small muted">Cancellation leaves generation 7 untouched · cutover fences every generation 7 worker lease</text>
+</svg>

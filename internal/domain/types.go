@@ -83,6 +83,40 @@ type Assignment struct {
 	Volumes        []Volume  `json:"volumes"`
 }
 
+// AssignmentLifecycle describes whether an immutable assignment generation is
+// merely being prepared, ready for an authority cutover, currently
+// authoritative, or historical. Preparing and arming never authorize flight.
+type AssignmentLifecycle string
+
+const (
+	AssignmentReceived   AssignmentLifecycle = "candidate_received"
+	AssignmentArmed      AssignmentLifecycle = "candidate_armed"
+	AssignmentActive     AssignmentLifecycle = "active"
+	AssignmentEnding     AssignmentLifecycle = "ending"
+	AssignmentCompleted  AssignmentLifecycle = "completed"
+	AssignmentCancelled  AssignmentLifecycle = "cancelled"
+	AssignmentSuperseded AssignmentLifecycle = "superseded"
+)
+
+// AssignmentRecord pairs an immutable assignment with its authority interval.
+// AuthorityUntil is exclusive: an observation exactly at a cutover belongs to
+// the replacement generation.
+type AssignmentRecord struct {
+	Assignment     Assignment          `json:"assignment"`
+	Lifecycle      AssignmentLifecycle `json:"lifecycle"`
+	AuthorityFrom  *time.Time          `json:"authority_from,omitempty"`
+	AuthorityUntil *time.Time          `json:"authority_until,omitempty"`
+	PreparedAt     time.Time           `json:"prepared_at"`
+	ArmedAt        *time.Time          `json:"armed_at,omitempty"`
+	CutoverAt      *time.Time          `json:"cutover_at,omitempty"`
+}
+
+// Authorizes reports whether observedAt belongs to this record's half-open
+// authority interval.
+func (r AssignmentRecord) Authorizes(observedAt time.Time) bool {
+	return r.AuthorityFrom != nil && !observedAt.Before(*r.AuthorityFrom) && (r.AuthorityUntil == nil || observedAt.Before(*r.AuthorityUntil))
+}
+
 // Observation is one normalized GLOBAL_POSITION_INT record read from InfluxDB.
 type Observation struct {
 	FrameID           string            `json:"frame_id"`
@@ -111,13 +145,17 @@ const (
 )
 
 type IncidentState struct {
-	Phase              IncidentPhase `json:"phase"`
-	ConsecutiveOutside int           `json:"consecutive_outside"`
-	ConsecutiveInside  int           `json:"consecutive_inside"`
-	FirstSuspectedAt   time.Time     `json:"first_suspected_at,omitempty"`
-	OpenedAt           time.Time     `json:"opened_at,omitempty"`
-	LastObservedAt     time.Time     `json:"last_observed_at,omitempty"`
-	WorstDeviationM    float64       `json:"worst_deviation_m,omitempty"`
+	Phase IncidentPhase `json:"phase"`
+	// OpeningFrameID is the stable identity of this incident occurrence. It
+	// survives recovery hysteresis so replay can amend the same episode without
+	// guessing from timestamps or another occurrence of the same violation.
+	OpeningFrameID     string    `json:"opening_frame_id,omitempty"`
+	ConsecutiveOutside int       `json:"consecutive_outside"`
+	ConsecutiveInside  int       `json:"consecutive_inside"`
+	FirstSuspectedAt   time.Time `json:"first_suspected_at,omitempty"`
+	OpenedAt           time.Time `json:"opened_at,omitempty"`
+	LastObservedAt     time.Time `json:"last_observed_at,omitempty"`
+	WorstDeviationM    float64   `json:"worst_deviation_m,omitempty"`
 }
 
 type EvaluatorState struct {
@@ -133,11 +171,14 @@ const (
 )
 
 type IncidentTransition struct {
-	Violation  ViolationType `json:"violation"`
-	Transition Transition    `json:"transition"`
-	ObservedAt time.Time     `json:"observed_at"`
-	FrameID    string        `json:"frame_id"`
-	DeviationM float64       `json:"deviation_m,omitempty"`
+	Violation      ViolationType `json:"violation"`
+	Transition     Transition    `json:"transition"`
+	ObservedAt     time.Time     `json:"observed_at"`
+	FrameID        string        `json:"frame_id"`
+	OpeningFrameID string        `json:"opening_frame_id"`
+	WALID          string        `json:"wal_id"`
+	WALSequence    uint64        `json:"wal_sequence"`
+	DeviationM     float64       `json:"deviation_m,omitempty"`
 }
 
 type Evaluation struct {
@@ -146,8 +187,12 @@ type Evaluation struct {
 	Recording   RecordingStatus      `json:"recording"`
 	State       EvaluatorState       `json:"state"`
 	Transitions []IncidentTransition `json:"transitions"`
-	ObservedAt  time.Time            `json:"observed_at"`
-	FrameID     string               `json:"frame_id"`
-	WALID       string               `json:"wal_id"`
-	WALSequence uint64               `json:"wal_sequence"`
+	// CausalFrom is the earliest observation or retained non-clear incident
+	// timestamp that contributed to this result. Durable commits fence it to the
+	// same assignment authority interval as the final watermark.
+	CausalFrom  time.Time `json:"causal_from"`
+	ObservedAt  time.Time `json:"observed_at"`
+	FrameID     string    `json:"frame_id"`
+	WALID       string    `json:"wal_id"`
+	WALSequence uint64    `json:"wal_sequence"`
 }

@@ -51,6 +51,60 @@ func TestEvaluatorOpensAndResolvesIndependentIncidents(t *testing.T) {
 	}
 }
 
+func TestEvaluateBatchTransitionsKeepOccurrenceAndOwnWALCursor(t *testing.T) {
+	now := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})
+	a := testAssignment(now)
+	opened := observation(now, 41, 35.02, -97.02, 100)
+	resolved := observation(now.Add(time.Second), 42, 35.005, -97.005, 100)
+	result, err := e.EvaluateBatch(a, []domain.Observation{opened, resolved}, domain.EvaluatorState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opening, resolution *domain.IncidentTransition
+	for i := range result.Transitions {
+		transition := &result.Transitions[i]
+		if transition.Violation != domain.ViolationLateral {
+			continue
+		}
+		switch transition.Transition {
+		case domain.TransitionOpened:
+			opening = transition
+		case domain.TransitionResolved:
+			resolution = transition
+		}
+	}
+	if opening == nil || resolution == nil || opening.OpeningFrameID != opened.FrameID || resolution.OpeningFrameID != opened.FrameID || opening.WALID != opened.WALID || opening.WALSequence != opened.WALSequence || resolution.WALID != resolved.WALID || resolution.WALSequence != resolved.WALSequence {
+		t.Fatalf("transition correlation opening=%#v resolution=%#v", opening, resolution)
+	}
+	if !result.CausalFrom.Equal(opened.ObservedAt) || !result.ObservedAt.Equal(resolved.ObservedAt) {
+		t.Fatalf("batch causal interval = [%s,%s], want [%s,%s]", result.CausalFrom, result.ObservedAt, opened.ObservedAt, resolved.ObservedAt)
+	}
+	if _, err = e.EvaluateBatch(a, []domain.Observation{resolved, opened}, domain.EvaluatorState{}); err == nil {
+		t.Fatal("out-of-order event-time batch was accepted")
+	}
+	priorStart := now.Add(-time.Second)
+	previous := domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral: {Phase: domain.IncidentSuspected, FirstSuspectedAt: priorStart, LastObservedAt: priorStart},
+	}}
+	cleared, err := e.EvaluateBatch(a, []domain.Observation{resolved}, previous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared.CausalFrom.Equal(priorStart) {
+		t.Fatalf("cleared batch lost retained causal start: got %s want %s", cleared.CausalFrom, priorStart)
+	}
+	direct := mustEvaluate(t, e, resolved.ObservedAt, a, resolved, previous)
+	if !direct.CausalFrom.Equal(priorStart) {
+		t.Fatalf("single evaluation lost retained causal start: got %s want %s", direct.CausalFrom, priorStart)
+	}
+	equalTimeEarlier := observation(now, 50, 35.02, -97.02, 100)
+	equalTimeLater := observation(now, 51, 35.005, -97.005, 100)
+	if _, err = e.EvaluateBatch(a, []domain.Observation{equalTimeLater, equalTimeEarlier}, domain.EvaluatorState{}); err == nil {
+		t.Fatal("equal-time decreasing WAL sequence was accepted")
+	}
+}
+
 func TestEvaluatorDoesNotGuessAltitudeReference(t *testing.T) {
 	now := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
 	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})

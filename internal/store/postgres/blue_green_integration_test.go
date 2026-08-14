@@ -1,0 +1,526 @@
+//go:build integration
+
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package postgres_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aero-arc/aero-arc-conformance/internal/domain"
+	postgresstore "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
+	"github.com/aero-arc/aero-arc-conformance/internal/testsupport"
+	"github.com/jackc/pgx/v5"
+	"github.com/testcontainers/testcontainers-go"
+)
+
+func TestBlueGreenAssignmentLifecycleAgainstPostgres(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	dsn := os.Getenv("AERO_CONFORMANCE_TEST_POSTGRES_URL")
+	if dsn == "" {
+		testcontainers.SkipIfProviderIsNotHealthy(t)
+		container, err := testsupport.StartPostgres(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dsn = container.URL
+		t.Cleanup(func() {
+			if err := container.Dependency.Shutdown(t.Failed(), os.Stderr); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	now := time.Now().UTC()
+	first, err := postgresstore.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := postgresstore.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	assertFreshSchema(t, ctx, dsn)
+
+	terminal := assignment(now, 1, 1)
+	terminal.ID = "assignment-terminal"
+	if _, err = first.PrepareAssignment(ctx, "api", "terminal-prepare", "assignment_prepared", terminal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = first.CancelCandidate(ctx, "api", "terminal-cancel", terminal.ID, terminal.Generation); err != nil {
+		t.Fatal(err)
+	}
+	reused := terminal
+	reused.Generation = 2
+	reused.AircraftID = "different-aircraft"
+	if _, err = first.PrepareAssignment(ctx, "api", "terminal-reuse", "assignment_prepared", reused); !errors.Is(err, postgresstore.ErrMessageConflict) {
+		t.Fatalf("terminal assignment identity was reusable: %v", err)
+	}
+
+	base := assignment(now, 1, 1)
+	activate(t, ctx, first, base, "v1", now.Add(-time.Minute))
+	claims, err := first.ClaimDueAssignments(ctx, "old-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("old claim=%#v err=%v", claims, err)
+	}
+	initialEvaluation := domain.Evaluation{
+		Condition:  domain.ConditionConforming,
+		Monitoring: domain.MonitoringCurrent,
+		Recording:  domain.RecordingPending,
+		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
+		Transitions: []domain.IncidentTransition{
+			{Violation: domain.ViolationLateral, Transition: domain.TransitionOpened, ObservedAt: now.Add(-2 * time.Second), FrameID: "incident-open", OpeningFrameID: "incident-open", WALID: "initial-wal", WALSequence: 1, DeviationM: 4},
+			{Violation: domain.ViolationLateral, Transition: domain.TransitionResolved, ObservedAt: now.Add(-time.Second), FrameID: "incident-resolved", OpeningFrameID: "incident-open", WALID: "initial-wal", WALSequence: 2},
+		},
+		CausalFrom:  now.Add(-2 * time.Second),
+		ObservedAt:  now.Add(-time.Second),
+		FrameID:     "initial-frame",
+		WALID:       "initial-wal",
+		WALSequence: 1,
+	}
+	if err = first.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: initialEvaluation, NextEvaluationAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err = first.ClaimDueAssignments(ctx, "old-worker-reclaimed", time.Minute, 10)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("reclaimed old assignment=%#v err=%v", claims, err)
+	}
+	oldClaim := claims[0]
+
+	replacedCandidate := assignment(now, 2, 2)
+	if _, err = first.PrepareAssignment(ctx, "api", "v2-prepare", "assignment_prepared", replacedCandidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = first.ArmAssignment(ctx, "api", "v2-arm", replacedCandidate.ID, replacedCandidate.Generation); err != nil {
+		t.Fatal(err)
+	}
+	candidate := assignment(now, 3, 3)
+	if _, err = first.PrepareAssignment(ctx, "api", "v3-prepare", "assignment_prepared", candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = first.ArmAssignment(ctx, "api", "v2-arm-after-replacement", replacedCandidate.ID, replacedCandidate.Generation); !errors.Is(err, postgresstore.ErrStaleAssignment) {
+		t.Fatalf("replaced candidate was not fenced: %v", err)
+	}
+	if _, err = first.ArmAssignment(ctx, "api", "v3-arm", candidate.ID, candidate.Generation); err != nil {
+		t.Fatal(err)
+	}
+
+	cutover := time.Now().UTC().Add(-time.Millisecond)
+	const callers = 8
+	results := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(store *postgresstore.Store) {
+			defer wg.Done()
+			_, err := store.CutoverAssignment(ctx, "api", "v3-cutover", candidate.ID, candidate.Generation, cutover)
+			results <- err
+		}([]*postgresstore.Store{first, second}[i%2])
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("concurrent idempotent cutover: %v", err)
+		}
+	}
+	before, found, err := first.ResolveAssignmentAt(ctx, base.ID, cutover.Add(-time.Nanosecond))
+	if err != nil || !found || before.Assignment.Generation != 1 {
+		t.Fatalf("before=%#v found=%v err=%v", before, found, err)
+	}
+	after, found, err := second.ResolveAssignmentAt(ctx, base.ID, cutover)
+	if err != nil || !found || after.Assignment.Generation != 3 || after.AuthorityUntil == nil || !after.AuthorityUntil.Equal(candidate.EffectiveUntil) {
+		t.Fatalf("after=%#v found=%v err=%v", after, found, err)
+	}
+	if _, found, err = second.ResolveAssignmentAt(ctx, base.ID, candidate.EffectiveUntil); err != nil || found {
+		t.Fatalf("replacement authority remained open at its exclusive end: found=%v err=%v", found, err)
+	}
+	if err = first.RenewAssignmentLease(ctx, oldClaim, time.Minute); !errors.Is(err, postgresstore.ErrLeaseLost) {
+		t.Fatalf("superseded lease renewed: %v", err)
+	}
+	claims, err = second.ClaimDueAssignments(ctx, "new-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != 3 {
+		t.Fatalf("replacement claim=%#v err=%v", claims, err)
+	}
+	currentClaim := claims[0]
+	// Replay the exact suffix that already opened and resolved an incident. The
+	// historical commit must reuse the immutable incident occurrence and events
+	// instead of failing on the resolved incident's primary key.
+	historical := initialEvaluation
+	historicalCommit := postgresstore.EvaluationCommit{Evaluation: historical, NextEvaluationAt: time.Now().UTC()}
+	if err = second.CommitHistoricalEvaluation(ctx, currentClaim, base.Generation, historicalCommit); err != nil {
+		t.Fatalf("historical reconciliation commit: %v", err)
+	}
+	if err = second.CommitHistoricalEvaluation(ctx, currentClaim, base.Generation, historicalCommit); !errors.Is(err, postgresstore.ErrLeaseLost) {
+		t.Fatalf("consumed current fence was reusable: %v", err)
+	}
+	assertHistoricalPersistence(t, ctx, dsn, base.ID, base.Generation, candidate.Generation, historical)
+
+	claims, err = second.ClaimDueAssignments(ctx, "shifted-history-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != candidate.Generation {
+		t.Fatalf("shifted-history claim=%#v err=%v", claims, err)
+	}
+	shifted := initialEvaluation
+	shifted.ObservedAt = cutover.Add(-time.Microsecond)
+	shifted.FrameID = "shifted-batch-final"
+	shifted.WALSequence = 3
+	shifted.State = domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{domain.ViolationLateral: {Phase: domain.IncidentClear, WorstDeviationM: 99}}}
+	shifted.Transitions = append([]domain.IncidentTransition(nil), initialEvaluation.Transitions...)
+	shifted.Transitions[1] = domain.IncidentTransition{Violation: domain.ViolationLateral, Transition: domain.TransitionResolved, ObservedAt: shifted.ObservedAt, FrameID: "incident-resolved-shifted", OpeningFrameID: "incident-open", WALID: "initial-wal", WALSequence: 3}
+	shiftedCommit := postgresstore.EvaluationCommit{Evaluation: shifted, NextEvaluationAt: time.Now().UTC()}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, shiftedCommit); err != nil {
+		t.Fatalf("shift historical resolution: %v", err)
+	}
+	assertShiftedResolution(t, ctx, dsn, base.ID, base.Generation, shifted.ObservedAt, 3, 3)
+
+	claims, err = second.ClaimDueAssignments(ctx, "exact-shift-replay-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != candidate.Generation {
+		t.Fatalf("exact-shift replay claim=%#v err=%v", claims, err)
+	}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, shiftedCommit); err != nil {
+		t.Fatalf("exact shifted-resolution replay: %v", err)
+	}
+	assertShiftedResolution(t, ctx, dsn, base.ID, base.Generation, shifted.ObservedAt, 3, 3)
+	claims, err = second.ClaimDueAssignments(ctx, "shift-back-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != candidate.Generation {
+		t.Fatalf("shift-back claim=%#v err=%v", claims, err)
+	}
+	shiftBack := shifted
+	shiftBack.Transitions = append([]domain.IncidentTransition(nil), shifted.Transitions...)
+	shiftBack.Transitions[1] = initialEvaluation.Transitions[1]
+	shiftBackCommit := postgresstore.EvaluationCommit{Evaluation: shiftBack, NextEvaluationAt: time.Now().UTC()}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, shiftBackCommit); err != nil {
+		t.Fatalf("shift resolution back to existing immutable event: %v", err)
+	}
+	assertShiftedResolution(t, ctx, dsn, base.ID, base.Generation, initialEvaluation.Transitions[1].ObservedAt, 3, 4)
+
+	claims, err = second.ClaimDueAssignments(ctx, "invalid-history-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.Generation != candidate.Generation {
+		t.Fatalf("invalid-history claim=%#v err=%v", claims, err)
+	}
+	beforeInvalid := readEvaluationFootprint(t, ctx, dsn, base.ID, base.Generation, candidate.Generation)
+	invalidOverlap := historicalCommit
+	invalidOverlap.Evaluation.Transitions = append([]domain.IncidentTransition(nil), historicalCommit.Evaluation.Transitions...)
+	invalidOverlap.Evaluation.Transitions[0].ObservedAt = base.EffectiveFrom.Add(-time.Nanosecond)
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidOverlap); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("historical transition crossed authority start: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid transition consumed the current fence: %v", err)
+	}
+	invalidState := historicalCommit
+	invalidState.Evaluation.State = domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral: {Phase: domain.IncidentSuspected, FirstSuspectedAt: base.EffectiveFrom.Add(-time.Nanosecond), LastObservedAt: base.EffectiveFrom},
+	}}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidState); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("historical state crossed authority start: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid state consumed the current fence: %v", err)
+	}
+	invalidState.Evaluation.State.Violations[domain.ViolationLateral] = domain.IncidentState{Phase: domain.IncidentOpen, OpeningFrameID: "incident-open", OpenedAt: base.EffectiveFrom, LastObservedAt: cutover}
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidState); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("historical state crossed exclusive authority end: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid upper-bound state consumed the current fence: %v", err)
+	}
+	invalidHistorical := historicalCommit
+	invalidHistorical.Evaluation.ObservedAt = cutover
+	invalidHistorical.Evaluation.FrameID = "wrong-interval-frame"
+	if err = second.CommitHistoricalEvaluation(ctx, claims[0], base.Generation, invalidHistorical); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("out-of-interval historical evaluation: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid history attempt consumed the current fence: %v", err)
+	}
+	if afterInvalid := readEvaluationFootprint(t, ctx, dsn, base.ID, base.Generation, candidate.Generation); afterInvalid != beforeInvalid {
+		t.Fatalf("rejected historical batches mutated durable state: before=%+v after=%+v", beforeInvalid, afterInvalid)
+	}
+	invalidLive := postgresstore.EvaluationCommit{Evaluation: domain.Evaluation{
+		Condition:  domain.ConditionNonConforming,
+		Monitoring: domain.MonitoringCurrent,
+		Recording:  domain.RecordingPending,
+		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
+		Transitions: []domain.IncidentTransition{{
+			Violation: domain.ViolationLateral, Transition: domain.TransitionOpened,
+			ObservedAt: cutover.Add(time.Nanosecond), FrameID: "live-cross-boundary",
+			OpeningFrameID: "live-cross-boundary", WALID: "live-wal", WALSequence: 1,
+		}},
+		CausalFrom: cutover.Add(-time.Nanosecond), ObservedAt: cutover.Add(2 * time.Microsecond), FrameID: "live-batch", WALID: "live-wal", WALSequence: 2,
+	}, NextEvaluationAt: time.Now().UTC()}
+	if err = second.CommitEvaluation(ctx, claims[0], invalidLive); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("live causal start crossed authority boundary: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("invalid live batch consumed the lease: %v", err)
+	}
+	if afterInvalid := readEvaluationFootprint(t, ctx, dsn, base.ID, base.Generation, candidate.Generation); afterInvalid != beforeInvalid {
+		t.Fatalf("rejected live batch mutated durable state: before=%+v after=%+v", beforeInvalid, afterInvalid)
+	}
+	afterAuthority := historicalCommit
+	afterAuthority.Evaluation.ObservedAt = candidate.EffectiveUntil
+	afterAuthority.Evaluation.FrameID = "after-authority-frame"
+	if err = second.CommitEvaluation(ctx, claims[0], afterAuthority); !errors.Is(err, postgresstore.ErrLeaseLost) {
+		t.Fatalf("live commit crossed exclusive authority end: %v", err)
+	}
+	if err = second.RenewAssignmentLease(ctx, claims[0], time.Minute); err != nil {
+		t.Fatalf("rejected post-authority commit consumed the lease: %v", err)
+	}
+
+	assertRetroactiveCutoverFence(t, ctx, first, dsn, now)
+	assertConcurrentCommitCutoverFence(t, ctx, first, second, dsn, now)
+}
+
+func assertFreshSchema(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var count, version int
+	if err = conn.QueryRow(ctx, `SELECT count(*),max(version) FROM schema_migrations`).Scan(&count, &version); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || version != 1 {
+		t.Fatalf("fresh schema ledger count=%d version=%d", count, version)
+	}
+}
+
+type evaluationFootprint struct {
+	HistoricalRevision int
+	CurrentRevision    int
+	Checkpoints        int
+	Summaries          int
+	Incidents          int
+	Events             int
+	RegistryOutbox     int
+}
+
+func readEvaluationFootprint(t *testing.T, ctx context.Context, dsn, assignmentID string, historicalGeneration, currentGeneration uint64) evaluationFootprint {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var result evaluationFootprint
+	if err = conn.QueryRow(ctx, `SELECT
+	(SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$3),
+	(SELECT count(*) FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_outbox WHERE assignment_id=$1 AND assignment_generation=$2 AND destination='registry')`, assignmentID, historicalGeneration, currentGeneration).Scan(
+		&result.HistoricalRevision,
+		&result.CurrentRevision,
+		&result.Checkpoints,
+		&result.Summaries,
+		&result.Incidents,
+		&result.Events,
+		&result.RegistryOutbox,
+	); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func assertConcurrentCommitCutoverFence(t *testing.T, ctx context.Context, first, second *postgresstore.Store, dsn string, now time.Time) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	for round := 0; round < 8; round++ {
+		if _, err = conn.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=now()+interval '1 day',lease_owner=NULL,lease_until=NULL`); err != nil {
+			t.Fatal(err)
+		}
+		current := assignment(now, 1, 1)
+		current.ID = fmt.Sprintf("assignment-cutover-race-%d", round)
+		activate(t, ctx, first, current, fmt.Sprintf("race-%d-v1", round), now.Add(-time.Minute))
+		claims, claimErr := first.ClaimDueAssignments(ctx, fmt.Sprintf("race-worker-%d", round), time.Minute, 10)
+		if claimErr != nil || len(claims) != 1 || claims[0].Assignment.ID != current.ID {
+			t.Fatalf("race claim round=%d claims=%#v err=%v", round, claims, claimErr)
+		}
+		replacement := assignment(now, 2, 2)
+		replacement.ID = current.ID
+		if _, err = first.PrepareAssignment(ctx, "api", fmt.Sprintf("race-%d-prepare", round), "assignment_prepared", replacement); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = first.ArmAssignment(ctx, "api", fmt.Sprintf("race-%d-arm", round), replacement.ID, replacement.Generation); err != nil {
+			t.Fatal(err)
+		}
+		boundary := now.Add(-10 * time.Second)
+		evaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, CausalFrom: boundary, ObservedAt: boundary, FrameID: fmt.Sprintf("race-frame-%d", round), WALID: "race-wal", WALSequence: uint64(round + 1)}
+		start := make(chan struct{})
+		commitResult := make(chan error, 1)
+		cutoverResult := make(chan error, 1)
+		go func() {
+			<-start
+			commitResult <- first.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: time.Now().UTC()})
+		}()
+		go func() {
+			<-start
+			_, cutoverErr := second.CutoverAssignment(ctx, "api", fmt.Sprintf("race-%d-cutover", round), replacement.ID, replacement.Generation, boundary)
+			cutoverResult <- cutoverErr
+		}()
+		close(start)
+		commitErr, cutoverErr := <-commitResult, <-cutoverResult
+		commitWon := commitErr == nil && errors.Is(cutoverErr, postgresstore.ErrInvalidTransition)
+		cutoverWon := errors.Is(commitErr, postgresstore.ErrLeaseLost) && cutoverErr == nil
+		if !commitWon && !cutoverWon {
+			t.Fatalf("race round=%d commit=%v cutover=%v", round, commitErr, cutoverErr)
+		}
+		var stranded int
+		if err = conn.QueryRow(ctx, `SELECT count(*) FROM conformance_assignments a JOIN conformance_summaries s USING(assignment_id,assignment_generation) WHERE a.assignment_id=$1 AND a.lifecycle_state='superseded' AND s.observed_at_unix_ns>=a.authority_until_unix_ns`, current.ID).Scan(&stranded); err != nil {
+			t.Fatal(err)
+		}
+		if stranded != 0 {
+			t.Fatalf("race round=%d stranded %d post-boundary summaries", round, stranded)
+		}
+	}
+}
+
+func assertShiftedResolution(t *testing.T, ctx context.Context, dsn, assignmentID string, generation uint64, wantResolvedAt time.Time, wantEvents, wantIncidentRevision int) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var resolvedAt time.Time
+	var events, incidentRevision int
+	var resolutionEventID string
+	if err = conn.QueryRow(ctx, `SELECT
+	(SELECT resolved_at FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT resolution_event_id FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT revision FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, generation).Scan(&resolvedAt, &resolutionEventID, &incidentRevision, &events); err != nil {
+		t.Fatal(err)
+	}
+	if resolvedAt.Sub(wantResolvedAt).Abs() >= time.Microsecond || resolutionEventID == "" || events != wantEvents || incidentRevision != wantIncidentRevision {
+		t.Fatalf("shifted resolution at=%s event=%q events=%d revision=%d", resolvedAt, resolutionEventID, events, incidentRevision)
+	}
+}
+
+func assertRetroactiveCutoverFence(t *testing.T, ctx context.Context, store *postgresstore.Store, dsn string, now time.Time) {
+	t.Helper()
+	current := assignment(now, 1, 1)
+	current.ID = "assignment-retroactive-cutover"
+	activate(t, ctx, store, current, "retro-v1", now.Add(-time.Minute))
+	claims, err := store.ClaimDueAssignments(ctx, "retro-worker", time.Minute, 10)
+	if err != nil || len(claims) != 1 || claims[0].Assignment.ID != current.ID {
+		t.Fatalf("retro claim=%#v err=%v", claims, err)
+	}
+	watermark := now.Add(-20 * time.Second)
+	evaluation := domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, CausalFrom: watermark, ObservedAt: watermark, FrameID: "retro-frame", WALID: "retro-wal", WALSequence: 1}
+	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	replacement := assignment(now, 2, 2)
+	replacement.ID = current.ID
+	if _, err = store.PrepareAssignment(ctx, "api", "retro-prepare", "assignment_prepared", replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ArmAssignment(ctx, "api", "retro-arm", replacement.ID, replacement.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.CutoverAssignment(ctx, "api", "retro-rejected", replacement.ID, replacement.Generation, watermark); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("retroactive cutover crossed committed watermark: %v", err)
+	}
+	if _, err = store.CutoverAssignment(ctx, "api", "retro-rejected", replacement.ID, replacement.Generation, watermark); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("identical rejected cutover was not safely retryable: %v", err)
+	}
+	assertRejectedCutoverState(t, ctx, dsn, current.ID)
+	safeBoundary := watermark.Add(time.Second)
+	if _, err = store.CutoverAssignment(ctx, "api", "retro-safe", replacement.ID, replacement.Generation, safeBoundary); err != nil {
+		t.Fatalf("safe later cutover: %v", err)
+	}
+	before, found, err := store.ResolveAssignmentAt(ctx, current.ID, safeBoundary.Add(-time.Nanosecond))
+	if err != nil || !found || before.Assignment.Generation != current.Generation {
+		t.Fatalf("safe cutover old boundary: %#v found=%v err=%v", before, found, err)
+	}
+	after, found, err := store.ResolveAssignmentAt(ctx, current.ID, safeBoundary)
+	if err != nil || !found || after.Assignment.Generation != replacement.Generation {
+		t.Fatalf("safe cutover new boundary: %#v found=%v err=%v", after, found, err)
+	}
+}
+
+func assertRejectedCutoverState(t *testing.T, ctx context.Context, dsn, assignmentID string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var active, armed, rejectedInbox, checkpoints, summaries, registryOutbox int
+	if err = conn.QueryRow(ctx, `SELECT
+	(SELECT count(*) FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=1 AND lifecycle_state='active'),
+	(SELECT count(*) FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=2 AND lifecycle_state='candidate_armed'),
+	(SELECT count(*) FROM conformance_inbox WHERE source='api' AND message_id='retro-rejected'),
+	(SELECT count(*) FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=1),
+	(SELECT count(*) FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=1),
+	(SELECT count(*) FROM conformance_outbox WHERE assignment_id=$1 AND assignment_generation=1 AND destination='registry')`, assignmentID).Scan(&active, &armed, &rejectedInbox, &checkpoints, &summaries, &registryOutbox); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 || armed != 1 || rejectedInbox != 0 || checkpoints != 1 || summaries != 1 || registryOutbox != 1 {
+		t.Fatalf("rejected cutover mutated state active=%d armed=%d inbox=%d checkpoints=%d summaries=%d registry_outbox=%d", active, armed, rejectedInbox, checkpoints, summaries, registryOutbox)
+	}
+}
+
+func assertHistoricalPersistence(t *testing.T, ctx context.Context, dsn, assignmentID string, historicalGeneration, currentGeneration uint64, evaluation domain.Evaluation) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, incidents, events int
+	var incidentState string
+	var observedAt time.Time
+	if err = conn.QueryRow(ctx, `SELECT
+  (SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2),
+  (SELECT evaluation_revision FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$3),
+  (SELECT count(*) FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2),
+  (SELECT count(*) FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
+  (SELECT count(*) FROM conformance_outbox WHERE assignment_id=$1 AND assignment_generation=$2 AND destination='registry'),
+	(SELECT observed_at FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT count(*) FROM conformance_events WHERE assignment_id=$1 AND assignment_generation=$2),
+	(SELECT state FROM conformance_incidents WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, historicalGeneration, currentGeneration).Scan(&historicalRevision, &currentRevision, &checkpoints, &summaries, &registryOutbox, &observedAt, &incidents, &events, &incidentState); err != nil {
+		t.Fatal(err)
+	}
+	if historicalRevision != 2 || currentRevision != 0 || checkpoints != 2 || summaries != 1 || registryOutbox != 1 || incidents != 1 || events != 2 || incidentState != "resolved" || observedAt.Sub(evaluation.ObservedAt).Abs() >= time.Microsecond {
+		t.Fatalf("historical persistence revision=%d current_revision=%d checkpoints=%d summaries=%d registry_outbox=%d incidents=%d events=%d incident_state=%s observed_at=%s", historicalRevision, currentRevision, checkpoints, summaries, registryOutbox, incidents, events, incidentState, observedAt)
+	}
+}
+
+func activate(t *testing.T, ctx context.Context, store *postgresstore.Store, value domain.Assignment, prefix string, effectiveAt time.Time) {
+	t.Helper()
+	if _, err := store.PrepareAssignment(ctx, "api", prefix+"-prepare", "assignment_prepared", value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ArmAssignment(ctx, "api", prefix+"-arm", value.ID, value.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CutoverAssignment(ctx, "api", prefix+"-cutover", value.ID, value.Generation, effectiveAt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assignment(now time.Time, generation uint64, intentVersion uint32) domain.Assignment {
+	return domain.Assignment{ID: "assignment-focused", Generation: generation, AircraftID: "aircraft", AgentID: "agent", FlightID: "flight", IntentID: "intent", IntentVersion: intentVersion, PolicyVersion: "standard-v1", EffectiveFrom: now.Add(-time.Hour), EffectiveUntil: now.Add(time.Hour), Volumes: []domain.Volume{{ID: "volume", Polygon: []domain.Point{{Latitude: 35, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97}, {Latitude: 35, Longitude: -97}}, AltitudeLowerM: 80, AltitudeUpperM: 120, AltitudeReference: domain.AltitudeMSL, StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour)}}}
+}

@@ -26,25 +26,51 @@ CREATE TABLE IF NOT EXISTS conformance_assignments (
   intent_id text NOT NULL,
   intent_version integer NOT NULL CHECK (intent_version > 0),
   policy_version text NOT NULL,
-  lifecycle_state text NOT NULL CHECK (lifecycle_state IN ('received','armed','active','ending','completed','cancelled','superseded')),
+  lifecycle_state text NOT NULL CHECK (lifecycle_state IN ('candidate_received','candidate_armed','active','ending','completed','cancelled','superseded')),
   specification jsonb NOT NULL,
+  authority_from timestamptz,
+  authority_until timestamptz,
+  authority_from_unix_ns bigint,
+  authority_until_unix_ns bigint,
   next_evaluation_at timestamptz NOT NULL DEFAULT now(),
   lease_owner text,
   lease_generation bigint NOT NULL DEFAULT 0,
   lease_until timestamptz,
   evaluation_revision bigint NOT NULL DEFAULT 0,
+  prepared_at timestamptz NOT NULL DEFAULT now(),
+  armed_at timestamptz,
+  cutover_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (assignment_id, assignment_generation)
+  PRIMARY KEY (assignment_id, assignment_generation),
+  CONSTRAINT conformance_authority_interval_valid CHECK (
+    (authority_from IS NULL) = (authority_from_unix_ns IS NULL)
+    AND (authority_until IS NULL) = (authority_until_unix_ns IS NULL)
+    AND (authority_until_unix_ns IS NULL OR authority_until_unix_ns > authority_from_unix_ns)
+  ),
+  CONSTRAINT conformance_lifecycle_authority_valid CHECK (
+    (lifecycle_state IN ('candidate_received','candidate_armed','cancelled') AND authority_from_unix_ns IS NULL AND authority_until_unix_ns IS NULL)
+    OR (lifecycle_state IN ('active','ending') AND authority_from_unix_ns IS NOT NULL AND authority_until_unix_ns IS NOT NULL)
+    OR (lifecycle_state = 'superseded' AND ((authority_from_unix_ns IS NULL AND authority_until_unix_ns IS NULL) OR (authority_from_unix_ns IS NOT NULL AND authority_until_unix_ns IS NOT NULL)))
+    OR lifecycle_state = 'completed'
+  )
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS conformance_one_live_assignment
+CREATE UNIQUE INDEX IF NOT EXISTS conformance_one_current_assignment
   ON conformance_assignments (assignment_id)
-  WHERE lifecycle_state IN ('received','armed','active','ending');
+  WHERE lifecycle_state IN ('active','ending');
+
+CREATE UNIQUE INDEX IF NOT EXISTS conformance_one_candidate_assignment
+  ON conformance_assignments (assignment_id)
+  WHERE lifecycle_state IN ('candidate_received','candidate_armed');
 
 CREATE INDEX IF NOT EXISTS conformance_assignments_due
   ON conformance_assignments (next_evaluation_at, lease_until)
-  WHERE lifecycle_state IN ('received','armed','active','ending');
+  WHERE lifecycle_state IN ('active','ending');
+
+CREATE INDEX IF NOT EXISTS conformance_assignment_authority_history
+  ON conformance_assignments (assignment_id, authority_from_unix_ns, authority_until_unix_ns)
+  WHERE authority_from_unix_ns IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS conformance_checkpoints (
   assignment_id text NOT NULL,
@@ -71,6 +97,8 @@ CREATE TABLE IF NOT EXISTS conformance_incidents (
   opened_at timestamptz NOT NULL,
   last_observed_at timestamptz NOT NULL,
   resolved_at timestamptz,
+  opening_frame_id text NOT NULL,
+  resolution_event_id text,
   revision bigint NOT NULL DEFAULT 1,
   details jsonb NOT NULL,
   FOREIGN KEY (assignment_id, assignment_generation) REFERENCES conformance_assignments(assignment_id, assignment_generation)
@@ -79,6 +107,9 @@ CREATE TABLE IF NOT EXISTS conformance_incidents (
 CREATE UNIQUE INDEX IF NOT EXISTS conformance_one_open_incident
   ON conformance_incidents (assignment_id, assignment_generation, incident_key)
   WHERE state = 'open';
+
+CREATE UNIQUE INDEX IF NOT EXISTS conformance_incident_occurrence
+  ON conformance_incidents (assignment_id, assignment_generation, incident_key, opening_frame_id);
 
 CREATE TABLE IF NOT EXISTS conformance_events (
   event_id text PRIMARY KEY,
@@ -93,11 +124,17 @@ CREATE TABLE IF NOT EXISTS conformance_events (
   wal_sequence bigint NOT NULL CHECK (wal_sequence >= 0),
   evaluation_revision bigint NOT NULL,
   payload jsonb NOT NULL,
-	payload_sha256 text NOT NULL,
+  payload_sha256 text NOT NULL,
+  deviation_m double precision NOT NULL DEFAULT 0,
+  evidence_version smallint NOT NULL DEFAULT 2 CHECK (evidence_version = 2),
   created_at timestamptz NOT NULL DEFAULT now(),
-	FOREIGN KEY (assignment_id, assignment_generation) REFERENCES conformance_assignments(assignment_id, assignment_generation),
-	FOREIGN KEY (incident_id) REFERENCES conformance_incidents(incident_id)
+  FOREIGN KEY (assignment_id, assignment_generation) REFERENCES conformance_assignments(assignment_id, assignment_generation),
+  FOREIGN KEY (incident_id) REFERENCES conformance_incidents(incident_id)
 );
+
+ALTER TABLE conformance_incidents
+  ADD CONSTRAINT conformance_incident_resolution_event
+  FOREIGN KEY (resolution_event_id) REFERENCES conformance_events(event_id);
 
 CREATE TABLE IF NOT EXISTS conformance_summaries (
   assignment_id text NOT NULL,
@@ -107,6 +144,7 @@ CREATE TABLE IF NOT EXISTS conformance_summaries (
   monitoring_status text NOT NULL,
   recording_status text NOT NULL,
   observed_at timestamptz NOT NULL,
+  observed_at_unix_ns bigint NOT NULL,
   frame_id text NOT NULL,
   payload jsonb NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now(),
@@ -136,3 +174,18 @@ CREATE TABLE IF NOT EXISTS conformance_outbox (
 CREATE INDEX IF NOT EXISTS conformance_outbox_due
   ON conformance_outbox (next_attempt_at, lease_until)
   WHERE delivered_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS conformance_assignment_transitions (
+  transition_id text PRIMARY KEY,
+  source text NOT NULL,
+  message_id text NOT NULL,
+  assignment_id text NOT NULL,
+  assignment_generation bigint NOT NULL,
+  from_state text,
+  to_state text NOT NULL,
+  effective_at timestamptz,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (assignment_id, assignment_generation)
+    REFERENCES conformance_assignments(assignment_id, assignment_generation)
+);

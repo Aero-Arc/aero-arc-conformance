@@ -8,6 +8,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -51,9 +52,7 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 	defer store.Close()
 	now := time.Now().UTC()
 	assignment := domain.Assignment{ID: "assignment-integration", Generation: 1, AircraftID: "aircraft-1", AgentID: "agent-1", FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 1, PolicyVersion: "standard-v1", EffectiveFrom: now.Add(-time.Minute), EffectiveUntil: now.Add(time.Hour), Volumes: []domain.Volume{{ID: "volume-1", Polygon: []domain.Point{{Latitude: 35, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97}, {Latitude: 35, Longitude: -97}}, AltitudeLowerM: 80, AltitudeUpperM: 120, AltitudeReference: domain.AltitudeMSL, StartsAt: now.Add(-time.Minute), EndsAt: now.Add(time.Hour)}}}
-	if result, err := store.ApplyAssignment(ctx, "api", "message-1", "prepare", assignment); err != nil || result.Disposition != postgresstore.ApplyApplied {
-		t.Fatalf("apply=%#v err=%v", result, err)
-	}
+	activateAssignment(t, ctx, store, assignment, "message-1", now)
 	claims, err := store.ClaimDueAssignments(ctx, "worker-a", 30*time.Second, 1)
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("claims=%#v err=%v", claims, err)
@@ -117,9 +116,7 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 	// suffix. The takeover restores that checkpoint, replays the remaining
 	// observations, commits once, and fences the stale worker.
 	assignment.ID = "assignment-reclaim"
-	if _, err = store.ApplyAssignment(ctx, "api", "message-2", "prepare", assignment); err != nil {
-		t.Fatal(err)
-	}
+	activateAssignment(t, ctx, store, assignment, "message-2", now)
 	claims, err = store.ClaimDueAssignments(ctx, "worker-a", time.Second, 1)
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("first reclaim claim=%#v err=%v", claims, err)
@@ -163,6 +160,173 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 	if err = store.CommitEvaluation(ctx, stale, postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: now}); err != postgresstore.ErrLeaseLost {
 		t.Fatalf("stale commit err=%v", err)
 	}
+
+	t.Run("blue-green assignment cutover", func(t *testing.T) {
+		testBlueGreenCutover(t, ctx, store, pg.URL, now)
+	})
+}
+
+func activateAssignment(t *testing.T, ctx context.Context, store *postgresstore.Store, assignment domain.Assignment, messagePrefix string, effectiveAt time.Time) {
+	t.Helper()
+	if result, err := store.PrepareAssignment(ctx, "api", messagePrefix+"-prepare", "assignment_prepared", assignment); err != nil || result.Disposition != postgresstore.ApplyApplied {
+		t.Fatalf("prepare=%#v err=%v", result, err)
+	}
+	if result, err := store.ArmAssignment(ctx, "api", messagePrefix+"-arm", assignment.ID, assignment.Generation); err != nil || result.Record.Lifecycle != domain.AssignmentArmed {
+		t.Fatalf("arm=%#v err=%v", result, err)
+	}
+	if result, err := store.CutoverAssignment(ctx, "api", messagePrefix+"-cutover", assignment.ID, assignment.Generation, effectiveAt); err != nil || result.Record.Lifecycle != domain.AssignmentActive {
+		t.Fatalf("cutover=%#v err=%v", result, err)
+	}
+}
+
+func testBlueGreenCutover(t *testing.T, ctx context.Context, store *postgresstore.Store, postgresURL string, now time.Time) {
+	base := domain.Assignment{ID: "assignment-blue-green", Generation: 1, AircraftID: "aircraft-blue", AgentID: "agent-blue", FlightID: "flight-blue", IntentID: "intent-blue", IntentVersion: 1, PolicyVersion: "standard-v1", EffectiveFrom: now.Add(-time.Hour), EffectiveUntil: now.Add(time.Hour), Volumes: []domain.Volume{{ID: "green-1", Polygon: []domain.Point{{Latitude: 35, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97}, {Latitude: 35, Longitude: -97}}, AltitudeLowerM: 80, AltitudeUpperM: 120, AltitudeReference: domain.AltitudeMSL, StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour)}}}
+	firstAuthority := now.Add(-10 * time.Second)
+	activateAssignment(t, ctx, store, base, "blue-v1", firstAuthority)
+	claims, err := store.ClaimDueAssignments(ctx, "blue-old-worker", 30*time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldClaim postgresstore.Claim
+	for _, claim := range claims {
+		if claim.Assignment.ID == base.ID {
+			oldClaim = claim
+		}
+	}
+	if oldClaim.Assignment.ID == "" {
+		t.Fatalf("active generation was not claimable: %#v", claims)
+	}
+
+	candidate := base
+	candidate.Generation = 2
+	candidate.IntentVersion = 2
+	candidate.Volumes[0].ID = "green-2"
+	if result, err := store.PrepareAssignment(ctx, "api", "blue-v2-prepare", "assignment_prepared", candidate); err != nil || result.Disposition != postgresstore.ApplyApplied {
+		t.Fatalf("prepare candidate=%#v err=%v", result, err)
+	}
+	before, found, err := store.ResolveAssignmentAt(ctx, base.ID, now.Add(-time.Second))
+	if err != nil || !found || before.Assignment.Generation != 1 {
+		t.Fatalf("prepared candidate changed authority: %#v found=%v err=%v", before, found, err)
+	}
+	if result, err := store.ArmAssignment(ctx, "api", "blue-v2-arm", candidate.ID, candidate.Generation); err != nil || result.Record.Lifecycle != domain.AssignmentArmed || result.Record.AuthorityFrom != nil {
+		t.Fatalf("armed candidate gained authority: %#v err=%v", result, err)
+	}
+	claims, err = store.ClaimDueAssignments(ctx, "blue-candidate-probe", time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, claim := range claims {
+		if claim.Assignment.ID == candidate.ID && claim.Assignment.Generation == candidate.Generation {
+			t.Fatal("armed candidate was claimable before cutover")
+		}
+	}
+	if result, err := store.CancelCandidate(ctx, "api", "blue-v2-cancel", candidate.ID, candidate.Generation); err != nil || result.Record.Lifecycle != domain.AssignmentCancelled {
+		t.Fatalf("cancel candidate=%#v err=%v", result, err)
+	}
+	stillCurrent, found, err := store.ResolveAssignmentAt(ctx, base.ID, now)
+	if err != nil || !found || stillCurrent.Assignment.Generation != 1 {
+		t.Fatalf("cancel disturbed current authority: %#v found=%v err=%v", stillCurrent, found, err)
+	}
+
+	replacement := candidate
+	replacement.Generation = 3
+	replacement.IntentVersion = 3
+	replacement.Volumes[0].ID = "green-3"
+	if _, err = store.PrepareAssignment(ctx, "api", "blue-v3-prepare", "assignment_prepared", replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ArmAssignment(ctx, "api", "blue-v3-arm", replacement.ID, replacement.Generation); err != nil {
+		t.Fatal(err)
+	}
+	cutover := time.Now().UTC().Add(-time.Millisecond)
+	result, err := store.CutoverAssignment(ctx, "api", "blue-v3-cutover", replacement.ID, replacement.Generation, cutover)
+	if err != nil || result.Record.Lifecycle != domain.AssignmentActive || result.Record.AuthorityFrom == nil || !result.Record.AuthorityFrom.Equal(cutover) {
+		t.Fatalf("replacement cutover=%#v err=%v", result, err)
+	}
+	oldAtBoundary, found, err := store.ResolveAssignmentAt(ctx, base.ID, cutover.Add(-time.Nanosecond))
+	if err != nil || !found || oldAtBoundary.Assignment.Generation != 1 {
+		t.Fatalf("pre-cutover observation resolved to %#v found=%v err=%v", oldAtBoundary, found, err)
+	}
+	newAtBoundary, found, err := store.ResolveAssignmentAt(ctx, base.ID, cutover)
+	if err != nil || !found || newAtBoundary.Assignment.Generation != 3 {
+		t.Fatalf("cutover observation resolved to %#v found=%v err=%v", newAtBoundary, found, err)
+	}
+	if err = store.CommitEvaluation(ctx, oldClaim, postgresstore.EvaluationCommit{Evaluation: sampleEvaluation(cutover), NextEvaluationAt: cutover.Add(time.Second)}); err != postgresstore.ErrLeaseLost {
+		t.Fatalf("superseded worker commit=%v", err)
+	}
+	claims, err = store.ClaimDueAssignments(ctx, "blue-new-worker", time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundReplacementClaim := false
+	for _, claim := range claims {
+		if claim.Assignment.ID == replacement.ID && claim.Assignment.Generation == replacement.Generation {
+			foundReplacementClaim = true
+		}
+	}
+	if !foundReplacementClaim {
+		t.Fatal("replacement was not claimable after cutover")
+	}
+	idempotent, err := store.CutoverAssignment(ctx, "api", "blue-v3-cutover", replacement.ID, replacement.Generation, cutover)
+	if err != nil || idempotent.Disposition != postgresstore.ApplyIdempotent {
+		t.Fatalf("cutover retry=%#v err=%v", idempotent, err)
+	}
+	if _, err = store.CutoverAssignment(ctx, "api", "blue-v3-cutover", replacement.ID, replacement.Generation, cutover.Add(time.Second)); err != postgresstore.ErrMessageConflict {
+		t.Fatalf("conflicting cutover retry=%v", err)
+	}
+	stale := base
+	if result, err := store.PrepareAssignment(ctx, "api", "blue-stale", "assignment_prepared", stale); err != nil || result.Disposition != postgresstore.ApplyStale {
+		t.Fatalf("stale prepare=%#v err=%v", result, err)
+	}
+
+	future := replacement
+	future.Generation = 4
+	future.IntentVersion = 4
+	if _, err = store.PrepareAssignment(ctx, "api", "blue-v4-prepare", "assignment_prepared", future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ArmAssignment(ctx, "api", "blue-v4-arm", future.ID, future.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.CutoverAssignment(ctx, "api", "blue-v4-future", future.ID, future.Generation, time.Now().UTC().Add(time.Minute)); !errors.Is(err, postgresstore.ErrInvalidTransition) {
+		t.Fatalf("future cutover error=%v", err)
+	}
+	if _, err = store.CancelCandidate(ctx, "api", "blue-v4-cancel", future.ID, future.Generation); err != nil {
+		t.Fatal(err)
+	}
+	current, found, err := store.ResolveAssignmentAt(ctx, base.ID, time.Now().UTC())
+	if err != nil || !found || current.Assignment.Generation != 3 {
+		t.Fatalf("failed future cutover disturbed authority: %#v found=%v err=%v", current, found, err)
+	}
+	assertBlueGreenPersistence(t, ctx, postgresURL, base.ID, cutover, replacement.EffectiveUntil)
+}
+
+func assertBlueGreenPersistence(t *testing.T, ctx context.Context, url, assignmentID string, cutover, replacementEnd time.Time) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var currentCount, candidateCount, oldSupersededTransitions int
+	var oldUntilUnixNS, newFromUnixNS, newUntilUnixNS int64
+	err = conn.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('active','ending')),
+	  (SELECT count(*) FROM conformance_assignments WHERE assignment_id=$1 AND lifecycle_state IN ('candidate_received','candidate_armed')),
+	  (SELECT authority_until_unix_ns FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=1),
+	  (SELECT authority_from_unix_ns FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=3),
+	  (SELECT authority_until_unix_ns FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=3),
+	  (SELECT count(*) FROM conformance_assignment_transitions WHERE assignment_id=$1 AND assignment_generation=1 AND from_state='active' AND to_state='superseded' AND effective_at=$2)`, assignmentID, cutover).Scan(&currentCount, &candidateCount, &oldUntilUnixNS, &newFromUnixNS, &newUntilUnixNS, &oldSupersededTransitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentCount != 1 || candidateCount != 0 || oldUntilUnixNS != cutover.UnixNano() || newFromUnixNS != cutover.UnixNano() || newUntilUnixNS != replacementEnd.UnixNano() || oldSupersededTransitions != 1 {
+		t.Fatalf("blue-green persistence current=%d candidate=%d old_until_ns=%d new_from_ns=%d new_until_ns=%d old_transitions=%d", currentCount, candidateCount, oldUntilUnixNS, newFromUnixNS, newUntilUnixNS, oldSupersededTransitions)
+	}
+}
+
+func sampleEvaluation(at time.Time) domain.Evaluation {
+	return domain.Evaluation{Condition: domain.ConditionConforming, Monitoring: domain.MonitoringCurrent, Recording: domain.RecordingPending, State: domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}}, CausalFrom: at, ObservedAt: at, FrameID: "blue-frame", WALID: "blue-wal", WALSequence: 1}
 }
 
 func assertDurableEvaluation(t *testing.T, ctx context.Context, url, assignmentID string, wantIncidents, wantEvents, wantRevisions int) {

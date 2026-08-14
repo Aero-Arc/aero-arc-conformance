@@ -17,12 +17,35 @@ boundaries unless an accepted design change explicitly moves them:
 
 - Assignment generation, worker lease generation, and evaluation revision are
   different fences. Do not collapse them.
+- A received or armed candidate never authorizes telemetry and is never
+  claimable. Only an explicit cutover can activate it.
+- At an assignment cutover, old authority is `[old_from, cutover)` and new
+  authority is `[cutover, new_until)`. Never union candidate and current
+  geometry, and resolve delayed observations by event time.
+- Preparing or cancelling a candidate must not change the current generation;
+  cutover must atomically fence every lease held by the superseded generation.
+- Historical reconciliation must be fenced by the current generation's lease,
+  remain scoped to the superseded authority interval, and never publish a live
+  Registry projection or revive a superseded lease.
+- Every evaluation carries its earliest causal observation/state timestamp;
+  commits fence that start, every transition/state timestamp, and the final
+  watermark to one stored half-open assignment authority interval.
+- Reject a cutover at or before the current generation's committed evaluation
+  watermark; never delete or reassign evidence whose outbox may be delivered.
+- Incident transitions own their WAL cursor and stable opening-frame occurrence
+  identity. Immutable event payloads must not contain mutable batch-final state.
+- Migration `001` is the unreleased baseline and may be refined before this
+  repository's first release. After release, applied migrations are immutable
+  and every schema change receives a new number with explicit upgrade tests.
 - Claim and renewal use PostgreSQL time. An expired lease must never be revived.
 - Summary, incidents, transition events, checkpoint, and delivery outbox commit
   atomically behind the current assignment lease.
 - Events use deterministic IDs and immutable insert semantics.
 - Telemetry windows are bounded. A saturated query is split or rejected; it is
   never silently treated as complete.
+- Evaluator batches must preserve the reader's canonical `(event time, agent,
+  WAL identity, WAL sequence, frame)` order; equal-time frames are not freely
+  interchangeable because incident hysteresis is order-sensitive.
 - Stable `frame_id` provides idempotency. A future `wal_id` plus WAL sequence
   provides ordering within one Agent WAL generation.
 - Sequence gaps are normal because the Agent WAL contains all MAVLink messages.
