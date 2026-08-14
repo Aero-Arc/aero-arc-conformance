@@ -31,6 +31,8 @@ var (
 
 type Store struct{ pool *pgxpool.Pool }
 
+// Open connects to PostgreSQL, verifies connectivity, and applies pending
+// schema migrations before returning the store.
 func Open(ctx context.Context, dsn string) (*Store, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -52,7 +54,10 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) Close()                         { s.pool.Close() }
+// Close releases the PostgreSQL connection pool.
+func (s *Store) Close() { s.pool.Close() }
+
+// Ping verifies that PostgreSQL is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 type ApplyDisposition string
@@ -518,6 +523,8 @@ type Claim struct {
 	EvaluationRevision uint64
 }
 
+// ClaimDueAssignments atomically leases due active assignments to workerID,
+// incrementing each lease generation as a takeover fence.
 func (s *Store) ClaimDueAssignments(ctx context.Context, workerID string, lease time.Duration, limit int) ([]Claim, error) {
 	if workerID == "" || lease <= 0 || limit < 1 {
 		return nil, fmt.Errorf("claim arguments are invalid")
@@ -551,6 +558,8 @@ SELECT specification,lease_generation,lease_until,evaluation_revision FROM claim
 	return claims, rows.Err()
 }
 
+// RenewAssignmentLease extends an unexpired lease only when the caller still
+// owns the exact assignment and lease generation.
 func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension time.Duration) error {
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
@@ -598,6 +607,8 @@ func (s *Store) GetReplayCheckpoint(ctx context.Context, assignmentID string, ge
 	return checkpoint, true, nil
 }
 
+// CommitEvaluation atomically records a live evaluation behind the assignment,
+// lease-generation, evaluation-revision, and authority-interval fences.
 func (s *Store) CommitEvaluation(ctx context.Context, claim Claim, commit EvaluationCommit) error {
 	if err := validateEvaluationCommit(commit); err != nil {
 		return err

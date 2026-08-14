@@ -26,6 +26,7 @@ type Policy struct {
 	TelemetryFreshness   time.Duration
 }
 
+// Validate reports whether the policy is complete and safe to evaluate.
 func (p Policy) Validate() error {
 	if p.Version == "" || !finiteNonnegative(p.HorizontalToleranceM) || !finiteNonnegative(p.VerticalToleranceM) || p.OpenAfterSamples < 1 || p.RecoverAfterSamples < 1 || p.TelemetryFreshness <= 0 {
 		return fmt.Errorf("%w: incomplete evaluator policy", ErrInvalidInput)
@@ -35,6 +36,7 @@ func (p Policy) Validate() error {
 
 type Evaluator struct{ policy Policy }
 
+// New constructs an evaluator after validating policy.
 func New(policy Policy) (*Evaluator, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
@@ -42,6 +44,8 @@ func New(policy Policy) (*Evaluator, error) {
 	return &Evaluator{policy: policy}, nil
 }
 
+// Evaluate applies one observation to previous evaluator state and returns the
+// resulting condition, incident state, and immutable transitions.
 func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observation domain.Observation, previous domain.EvaluatorState) (domain.Evaluation, error) {
 	if err := validateAssignment(assignment, e.policy); err != nil {
 		return domain.Evaluation{}, err

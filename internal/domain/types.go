@@ -111,6 +111,8 @@ type AssignmentRecord struct {
 	CutoverAt      *time.Time          `json:"cutover_at,omitempty"`
 }
 
+// Authorizes reports whether observedAt belongs to this record's half-open
+// authority interval.
 func (r AssignmentRecord) Authorizes(observedAt time.Time) bool {
 	return r.AuthorityFrom != nil && !observedAt.Before(*r.AuthorityFrom) && (r.AuthorityUntil == nil || observedAt.Before(*r.AuthorityUntil))
 }
