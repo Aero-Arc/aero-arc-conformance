@@ -1,0 +1,88 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package grpc
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/aero-arc/aero-arc-conformance/internal/domain"
+	postgresstore "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
+	conformancev1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type assignmentStoreStub struct {
+	prepared domain.Assignment
+	record   domain.AssignmentRecord
+	err      error
+}
+
+func (s *assignmentStoreStub) PrepareAssignment(_ context.Context, _, _, _ string, assignment domain.Assignment) (postgresstore.ApplyResult, error) {
+	s.prepared = assignment
+	return postgresstore.ApplyResult{Disposition: postgresstore.ApplyApplied, Assignment: assignment}, s.err
+}
+func (s *assignmentStoreStub) CancelCandidate(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error) {
+	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
+}
+func (s *assignmentStoreStub) CutoverAssignment(context.Context, string, string, string, uint64, time.Time) (postgresstore.LifecycleResult, error) {
+	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
+}
+func (s *assignmentStoreStub) GetAssignment(context.Context, string, uint64) (domain.AssignmentRecord, error) {
+	if s.err != nil {
+		return domain.AssignmentRecord{}, s.err
+	}
+	if s.record.Assignment.ID == "" {
+		return domain.AssignmentRecord{Assignment: s.prepared, Lifecycle: domain.AssignmentReceived}, nil
+	}
+	return s.record, nil
+}
+
+func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {
+	store := &assignmentStoreStub{}
+	server, err := New(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	response, err := server.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{
+		Source: "api", MessageId: "message-1",
+		Assignment: &conformancev1.Assignment{
+			AssignmentId: "assignment-1", AssignmentGeneration: 7, AircraftId: "aircraft-1", AgentId: "agent-1",
+			FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 3, PolicyVersion: "standard-v1",
+			EffectiveFrom: timestamppb.New(now), EffectiveUntil: timestamppb.New(now.Add(time.Hour)),
+			Volumes: []*conformancev1.ConformanceVolume{{VolumeId: "volume-1", AltitudeReference: conformancev1.AltitudeReference_ALTITUDE_REFERENCE_MSL, StartsAt: timestamppb.New(now), EndsAt: timestamppb.New(now.Add(time.Hour)), Polygon: []*conformancev1.GeographicPoint{{Latitude: 1, Longitude: 2}, {Latitude: 1, Longitude: 3}, {Latitude: 2, Longitude: 3}}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.prepared.Generation != 7 || len(store.prepared.Volumes) != 1 || response.GetAssignment().GetLifecycle() != conformancev1.AssignmentLifecycle_ASSIGNMENT_LIFECYCLE_CANDIDATE_RECEIVED {
+		t.Fatalf("prepared=%+v response=%+v", store.prepared, response)
+	}
+}
+
+func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
+	server, err := New(&assignmentStoreStub{err: postgresstore.ErrStaleAssignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("missing cutover timestamp error = %v", err)
+	}
+	if _, err := server.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale assignment error = %v", err)
+	}
+	missing, err := New(&assignmentStoreStub{err: postgresstore.ErrAssignmentNotFound})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := missing.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: 1}); status.Code(err) != codes.NotFound {
+		t.Fatalf("missing assignment error = %v", err)
+	}
+}

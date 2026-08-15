@@ -7,25 +7,43 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aero-arc/aero-arc-conformance/internal/config"
+	registryprojection "github.com/aero-arc/aero-arc-conformance/internal/projection/registry"
 	postgresstore "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
 	telemetryinflux "github.com/aero-arc/aero-arc-conformance/internal/telemetry/influx"
+	assignmentgrpc "github.com/aero-arc/aero-arc-conformance/internal/transport/grpc"
+	registryv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/registry/v1"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	gogrpc "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
+// App owns the Conformance process resources, ingress servers, and Registry
+// publisher lifecycle.
 type App struct {
-	cfg    config.Config
-	log    *slog.Logger
-	store  *postgresstore.Store
-	reader *telemetryinflux.Reader
-	server *http.Server
-	ready  atomic.Bool
+	cfg                config.Config
+	log                *slog.Logger
+	store              *postgresstore.Store
+	reader             *telemetryinflux.Reader
+	managementServer   *http.Server
+	assignmentServer   *assignmentgrpc.Server
+	registryConnection *gogrpc.ClientConn
+	publisher          *registryprojection.Publisher
+	runCancel          context.CancelFunc
+	ready              atomic.Bool
+	shutdownOnce       sync.Once
+	shutdownErr        error
 }
 
 // New constructs app from the supplied configuration and dependencies.
@@ -48,22 +66,51 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		store.Close()
 		return nil, err
 	}
+	assignmentServer, err := assignmentgrpc.New(store)
+	if err != nil {
+		_ = reader.Close()
+		store.Close()
+		return nil, err
+	}
+	var transportCredentials credentials.TransportCredentials
+	if cfg.Registry.Insecure {
+		transportCredentials = insecure.NewCredentials()
+	} else {
+		transportCredentials = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+	}
+	registryConnection, err := gogrpc.NewClient(cfg.Registry.Address, gogrpc.WithTransportCredentials(transportCredentials))
+	if err != nil {
+		_ = reader.Close()
+		store.Close()
+		return nil, fmt.Errorf("create Registry client: %w", err)
+	}
+	publisher, err := registryprojection.New(store, registryv1.NewAeroRegistryClient(registryConnection), registryprojection.Config{
+		WorkerID: cfg.Worker.ID + ":registry", PollInterval: cfg.Registry.PublishInterval.Value(),
+		RequestTimeout: cfg.Registry.RequestTimeout.Value(), LeaseDuration: cfg.Registry.LeaseDuration.Value(),
+		RetryDelay: cfg.Registry.RetryDelay.Value(), BatchSize: cfg.Registry.BatchSize,
+	}, log)
+	if err != nil {
+		_ = registryConnection.Close()
+		_ = reader.Close()
+		store.Close()
+		return nil, err
+	}
 	mux := http.NewServeMux()
-	a := &App{cfg: cfg, log: log, store: store, reader: reader}
+	a := &App{cfg: cfg, log: log, store: store, reader: reader, assignmentServer: assignmentServer, registryConnection: registryConnection, publisher: publisher}
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/readyz", a.handleReady)
-	a.server = &http.Server{Addr: cfg.Service.ManagementAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	a.managementServer = &http.Server{Addr: cfg.Service.ManagementAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	a.ready.Store(true)
 	return a, nil
 }
 
-// Run serves the management endpoint until context cancellation or a terminal
-// HTTP server failure. Cancellation performs graceful shutdown and returns the
-// shutdown result rather than the context cancellation error.
+// Run serves management and assignment gRPC endpoints while publishing the
+// durable Registry outbox. A terminal server failure or context cancellation
+// performs bounded graceful shutdown.
 //
 // Parameters:
 //   - ctx: controls cancellation and deadlines for the operation.
@@ -71,20 +118,34 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 // Returns:
 //   - error: reports graceful-shutdown/close failure or a wrapped ListenAndServe failure.
 func (a *App) Run(ctx context.Context) error {
-	errors := make(chan error, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	a.runCancel = cancel
+	listener, err := net.Listen("tcp", a.cfg.Service.GRPCAddress)
+	if err != nil {
+		_ = a.Shutdown()
+		return fmt.Errorf("listen for assignment gRPC: %w", err)
+	}
+	errCh := make(chan error, 2)
 	go func() {
-		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errors <- err
+		if serveErr := a.managementServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
+			errCh <- fmt.Errorf("management server: %w", serveErr)
 		}
 	}()
+	go func() {
+		if serveErr := a.assignmentServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, gogrpc.ErrServerStopped) {
+			errCh <- fmt.Errorf("assignment gRPC server: %w", serveErr)
+		}
+	}()
+	go func() { _ = a.publisher.Run(runCtx) }()
 	select {
-	case <-ctx.Done():
+	case <-runCtx.Done():
 		return a.Shutdown()
-	case err := <-errors:
+	case err := <-errCh:
 		_ = a.Shutdown()
-		return fmt.Errorf("management server: %w", err)
+		return err
 	}
 }
+
 func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
 	if !a.ready.Load() {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
@@ -105,14 +166,29 @@ func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
 // Returns:
 //   - error: reports validation, dependency, cancellation, or persistence failures.
 func (a *App) Shutdown() error {
-	a.ready.Store(false)
-	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Service.ShutdownTimeout.Value())
-	defer cancel()
-	serverErr := a.server.Shutdown(ctx)
-	readerErr := a.reader.Close()
-	a.store.Close()
-	if serverErr != nil {
-		return serverErr
-	}
-	return readerErr
+	a.shutdownOnce.Do(func() {
+		a.ready.Store(false)
+		if a.runCancel != nil {
+			a.runCancel()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Service.ShutdownTimeout.Value())
+		defer cancel()
+		managementErr := a.managementServer.Shutdown(ctx)
+		grpcDone := make(chan struct{})
+		go func() {
+			a.assignmentServer.GracefulStop()
+			close(grpcDone)
+		}()
+		select {
+		case <-grpcDone:
+		case <-ctx.Done():
+			a.assignmentServer.Stop()
+			<-grpcDone
+		}
+		connectionErr := a.registryConnection.Close()
+		readerErr := a.reader.Close()
+		a.store.Close()
+		a.shutdownErr = errors.Join(managementErr, connectionErr, readerErr)
+	})
+	return a.shutdownErr
 }

@@ -7,10 +7,10 @@ and records replayable incident evidence.
 
 > [!IMPORTANT]
 > This repository begins as a bounded prototype. The evaluator, fenced lease
-> store, and forward-contract InfluxDB reader are real and tested as libraries.
-> The current binary only initializes dependencies and serves management HTTP;
-> it does not yet ingest assignments or run the claim/poll/evaluate/outbox loop.
-> Cross-repository Protobuf contracts remain intentionally unfinalized.
+> store, and forward-contract InfluxDB reader are real and tested. The binary
+> now serves assignment lifecycle gRPC and delivers committed live projections
+> to Registry through a leased PostgreSQL outbox. It does not yet run the
+> telemetry claim/poll/evaluate loop.
 
 ![Aero Arc Conformance data flow from mission assignment and telemetry through evaluation into live and durable state](docs/images/conformance-data-flow.svg)
 
@@ -27,6 +27,8 @@ interrupt Relay telemetry acknowledgement or storage.
 - Numbered PostgreSQL migrations for assignments, inbox, fenced leases,
   checkpoints, incidents, immutable transition events, summaries, and outbox.
 - Atomic assignment application and atomic fenced evaluation commits.
+- Idempotent assignment prepare/cancel/cutover gRPC plus exact-generation reads.
+- Independently leased Registry outbox publication with exact evaluation acknowledgement.
 - Blue-green assignment preparation: current and armed generations coexist,
   then an explicit event-time cutover atomically transfers authority.
 - Forward-contract InfluxDB 3 reader with bounded aircraft batches, time
@@ -52,10 +54,11 @@ go test -tags=integration -timeout=10m ./internal/integration
 go run ./cmd/aero-arc-conformance --config-path configs/config.yaml
 ```
 
-`go run` validates initialization and management wiring only. It will not begin
-monitoring flights until the assignment ingress and worker runtime slice lands.
+`go run` accepts assignment lifecycle commands and publishes any committed
+Registry outbox rows. It will not evaluate telemetry until the worker runtime
+slice lands and Relay supplies the required `wal_id` contract.
 
-Management endpoints default to:
+Assignment gRPC defaults to `:50052`. Management endpoints default to:
 
 - `GET /healthz` — process liveness.
 - `GET /readyz` — initialized process with reachable PostgreSQL.

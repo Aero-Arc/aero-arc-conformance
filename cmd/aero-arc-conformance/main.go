@@ -38,7 +38,7 @@ func main() {
 		log.Error("initialize conformance", "error", err)
 		os.Exit(1)
 	}
-	log.Info("conformance started", "management_address", cfg.Service.ManagementAddress, "worker_id", cfg.Worker.ID)
+	log.Info("conformance started", "management_address", cfg.Service.ManagementAddress, "grpc_address", cfg.Service.GRPCAddress, "registry_address", cfg.Registry.Address, "worker_id", cfg.Worker.ID)
 	if err = application.Run(ctx); err != nil {
 		log.Error("conformance stopped", "error", err)
 		os.Exit(1)

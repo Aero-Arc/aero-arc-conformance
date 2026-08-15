@@ -59,7 +59,8 @@ boundaries unless an accepted design change explicitly moves them:
 - Merged telemetry does not yet contain `wal_id`.
 - Relay currently acknowledges queue admission before durable InfluxDB flush;
   audit-grade conformance requires that acknowledged-loss gap to be closed.
-- The runtime claim/poll loop and external Protobuf contracts are the next slice.
+- The assignment gRPC and Registry outbox publisher are wired; the telemetry
+  claim/poll/evaluate loop remains the next runtime slice.
 - The reader is forward-contract-only and must fail loudly until Agent and Relay
   provide `wal_id`; do not add a silent sequence-only fallback.
 - Reader overlap currently deduplicates within a returned window. Persistent

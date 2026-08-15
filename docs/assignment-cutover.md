@@ -108,17 +108,18 @@ cannot be rounded onto the wrong generation.
 - The transition history and API outbox are written in the same transaction as
   every lifecycle change.
 
-## Runtime contract still to add
+## Runtime contract
 
 The candidate-specific database names are also a rollback fence: the original
 prototype binary only recognizes `received` and `armed`, so it cannot claim a
 new candidate if a binary is accidentally rolled back.
 
-The store contract and real-PostgreSQL tests implement this lifecycle. The
-external Protobuf API and worker runtime remain a later slice. That contract
-should carry assignment ID, assignment generation, exact intent ID/version,
-stable message ID, and cutover `effective_at`. Reconciliation should compare the
-API's current and pending generations with Conformance after ambiguous delivery.
+The store and external Protobuf contracts implement this lifecycle. The gRPC
+surface carries assignment ID, assignment generation, exact intent ID/version,
+stable message ID, and cutover `effective_at`; exact-generation reads support
+reconciliation after ambiguous delivery. The worker that validates and arms a
+candidate remains a later runtime slice and is intentionally not exposed as an
+API-owned command.
 
 The current store supports exact suffix replay and a shifted resolution for a
 stable incident occurrence. A future arbitrary-suffix reconciliation contract

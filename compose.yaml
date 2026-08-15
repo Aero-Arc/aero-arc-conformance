@@ -40,7 +40,10 @@ services:
       AERO_CONFORMANCE_INFLUX_TOKEN: local-development-no-auth
       AERO_CONFORMANCE_INFLUX_DATABASE: conformance
       AERO_CONFORMANCE_WORKER_ID: compose-1
-    ports: ["127.0.0.1:2112:2112"]
+      AERO_CONFORMANCE_REGISTRY_ADDRESS: registry:50051
+    ports:
+      - "127.0.0.1:2112:2112"
+      - "127.0.0.1:50052:50052"
     volumes:
       - ./configs/config.yaml:/etc/aero-arc/config.yaml:ro
 

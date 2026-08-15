@@ -26,6 +26,7 @@ func TestValidateRejectsUnsafePolicyAndLogging(t *testing.T) {
 	cfg.Postgres.URL = "postgres://example"
 	cfg.Influx.Host = "http://example"
 	cfg.Influx.Database = "telemetry"
+	cfg.Registry.Address = "registry:50051"
 	cfg.Worker.ID = "worker"
 	cfg.Policy.HorizontalToleranceM = math.NaN()
 	if err := cfg.Validate(); err == nil {

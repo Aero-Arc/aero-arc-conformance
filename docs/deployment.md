@@ -1,20 +1,19 @@
 # Deployment
 
-The prototype runs one intentionally inert process plus PostgreSQL and InfluxDB.
-The current process initializes numbered migrations and clients, then serves
-management HTTP. It has no assignment ingress, claim worker, or gRPC server yet.
+The prototype initializes numbered migrations and clients, serves management
+HTTP and assignment lifecycle gRPC, and drains committed Registry projection
+outbox messages. It still has no telemetry claim/evaluate worker loop.
 The tested store is designed for multiple replicas: advisory-locked migrations,
 revision-fenced commits, and assignment leases prevent competing commits.
 
 Deployments should expose `/healthz`, `/readyz`, and `/metrics` only on a
 management network. Readiness requires initialized migrations and reachable
-PostgreSQL. Future production readiness will also include assignment ingress,
-Influx query health, Registry projection delivery, and a running claim loop.
+PostgreSQL. Future production readiness will also include Influx query health,
+Registry projection delivery health, and a running telemetry claim loop.
 
-Current graceful shutdown stops readiness, shuts down management HTTP, and
-closes clients within a bounded timeout. The worker slice must extend this to
-stop new claims, fence active work, drain outbox delivery, and stop assignment
-gRPC before production deployment.
+Current graceful shutdown stops readiness, assignment gRPC, Registry delivery,
+management HTTP, and clients within a bounded timeout. The worker slice must
+extend this to stop new telemetry claims and fence active evaluation work.
 
 Assignment replacements roll out through
 `candidate_received → candidate_armed → active`.

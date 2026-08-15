@@ -188,7 +188,7 @@ one incident episode, and proves the old worker cannot commit.
 
 ## Registry projection
 
-Registry is proposed to evolve into a bounded live-state directory. A separate
+Registry is a bounded live-state directory for Conformance summaries. A separate
 long-lived assignment fence survives the short snapshot TTL. Publish operations
 compare assignment generation and evaluation revision; persistence confirmation
 matches the exact evaluation ID. Lower generations/revisions are stale, exact
@@ -212,7 +212,7 @@ changes, and periodic freshness—not every telemetry frame.
 
 ## Prototype gates
 
-Before finalizing cross-repository Protobuf contracts, prove:
+Before treating the current cross-repository contracts as production-ready, prove:
 
 - delayed visibility and overlap replay semantics;
 - same-timestamp pagination without loss;
@@ -226,11 +226,13 @@ Before finalizing cross-repository Protobuf contracts, prove:
 
 1. Stabilize this evaluator, store, reader, recovery integration, and implement
    the currently deferred workload benchmark.
-2. Protos add WAL identity, assignment/readiness, and Registry projection RPCs.
+2. Protos define assignment lifecycle and Registry projection RPCs; telemetry
+   contracts still add WAL identity.
 3. Agent creates and transmits `wal_id`.
 4. Relay persists `wal_id` and closes the acknowledged-loss gap.
 5. Registry implements assignment fencing and TTL live projection.
-6. Conformance wires assignment server, worker loop, and projection outbox.
+6. Conformance wires the assignment server and projection outbox; the telemetry
+   worker loop follows after the reader gates are satisfied.
 7. API adds assignment outbox, readiness gating, and live/durable composition.
 8. Ops displays the three status axes and incident detail.
 9. A SITL system test proves breach, recovery, persistence degradation, and

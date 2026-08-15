@@ -24,6 +24,8 @@ worker fencing. Docker availability is the only reason they may skip locally.
 - `internal/domain`: stable in-process types.
 - `internal/evaluator`: pure deterministic evaluator.
 - `internal/telemetry/influx`: bounded observation reader.
+- `internal/transport/grpc`: assignment lifecycle transport adapter.
+- `internal/projection/registry`: leased durable Registry publication.
 - `internal/store/postgres`: migrations and atomic persistence operations.
 - `internal/app`: process lifecycle and management endpoints.
 - `internal/integration`: multi-dependency behavior tests.
