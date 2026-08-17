@@ -2,8 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// Package app owns process lifecycle and management endpoints.
-package app
+// Package conformance owns the Conformance service lifecycle and management
+// endpoints.
+package conformance
 
 import (
 	"context"
@@ -29,9 +30,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// App owns the Conformance process resources, ingress servers, and Registry
-// publisher lifecycle.
-type App struct {
+// Conformance owns the service's process resources, ingress servers, and
+// Registry publisher lifecycle.
+type Conformance struct {
 	cfg                config.Config
 	log                *slog.Logger
 	store              *postgresstore.Store
@@ -46,17 +47,23 @@ type App struct {
 	shutdownErr        error
 }
 
-// New constructs app from the supplied configuration and dependencies.
+// New constructs the Conformance service from the supplied configuration and
+// dependencies.
 //
 // Parameters:
-//   - ctx: controls cancellation and deadlines for the operation.
-//   - cfg: provides the configuration values used to initialize or execute the operation.
-//   - log: is the *slog.Logger value supplied to New.
+//   - ctx: bounds initial PostgreSQL connection and migration work; cancelling
+//     it after New returns does not stop the service.
+//   - cfg: defines the durable store, bounded telemetry reader, ingress,
+//     Registry publisher, and graceful-shutdown settings.
+//   - log: receives service and Registry publisher diagnostics.
 //
 // Returns:
-//   - result: is the *App value produced by New.
-//   - error: reports validation, dependency, cancellation, or persistence failures.
-func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
+//   - conformance: owns all opened process resources and is ready to run; no
+//     assignment or evaluation authority is changed during construction.
+//   - error: reports PostgreSQL, telemetry reader, assignment server, Registry
+//     connection, or publisher initialization failure. Resources opened before
+//     a failure are closed before the error is returned.
+func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance, error) {
 	store, err := postgresstore.Open(ctx, cfg.Postgres.URL)
 	if err != nil {
 		return nil, err
@@ -96,16 +103,16 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	a := &App{cfg: cfg, log: log, store: store, reader: reader, assignmentServer: assignmentServer, registryConnection: registryConnection, publisher: publisher}
+	conformance := &Conformance{cfg: cfg, log: log, store: store, reader: reader, assignmentServer: assignmentServer, registryConnection: registryConnection, publisher: publisher}
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/readyz", a.handleReady)
-	a.managementServer = &http.Server{Addr: cfg.Service.ManagementAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
-	a.ready.Store(true)
-	return a, nil
+	mux.HandleFunc("/readyz", conformance.handleReady)
+	conformance.managementServer = &http.Server{Addr: cfg.Service.ManagementAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
+	conformance.ready.Store(true)
+	return conformance, nil
 }
 
 // Run serves management and assignment gRPC endpoints while publishing the
@@ -113,47 +120,51 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 // performs bounded graceful shutdown.
 //
 // Parameters:
-//   - ctx: controls cancellation and deadlines for the operation.
+//   - ctx: defines the service lifetime. Cancellation stops publication and
+//     initiates bounded shutdown; it does not alter assignment generations or
+//     evaluation authority.
 //
 // Returns:
-//   - error: reports graceful-shutdown/close failure or a wrapped ListenAndServe failure.
-func (a *App) Run(ctx context.Context) error {
+//   - error: reports assignment listener, management server, assignment gRPC
+//     server, or graceful-shutdown failure. Context cancellation itself is not
+//     returned when owned resources close successfully.
+func (c *Conformance) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
-	a.runCancel = cancel
-	listener, err := net.Listen("tcp", a.cfg.Service.GRPCAddress)
+	c.runCancel = cancel
+	listener, err := net.Listen("tcp", c.cfg.Service.GRPCAddress)
 	if err != nil {
-		_ = a.Shutdown()
+		_ = c.Shutdown()
 		return fmt.Errorf("listen for assignment gRPC: %w", err)
 	}
 	errCh := make(chan error, 2)
 	go func() {
-		if serveErr := a.managementServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
+		if serveErr := c.managementServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
 			errCh <- fmt.Errorf("management server: %w", serveErr)
 		}
 	}()
 	go func() {
-		if serveErr := a.assignmentServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, gogrpc.ErrServerStopped) {
+		if serveErr := c.assignmentServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, gogrpc.ErrServerStopped) {
 			errCh <- fmt.Errorf("assignment gRPC server: %w", serveErr)
 		}
 	}()
-	go func() { _ = a.publisher.Run(runCtx) }()
+	go func() { _ = c.publisher.Run(runCtx) }()
 	select {
 	case <-runCtx.Done():
-		return a.Shutdown()
+		return c.Shutdown()
 	case err := <-errCh:
-		_ = a.Shutdown()
+		_ = c.Shutdown()
 		return err
 	}
 }
 
-func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
-	if !a.ready.Load() {
+func (c *Conformance) handleReady(w http.ResponseWriter, r *http.Request) {
+	if !c.ready.Load() {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	if err := a.store.Ping(ctx); err != nil {
+	if err := c.store.Ping(ctx); err != nil {
 		http.Error(w, "postgres unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -161,34 +172,38 @@ func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ready\n"))
 }
 
-// Shutdown stops App and releases its owned resources.
+// Shutdown stops the Conformance service and releases its owned resources.
+// Repeated calls are idempotent and return the result of the first shutdown.
+// Shutdown does not delete assignments, checkpoints, evidence, or durable
+// outbox rows.
 //
 // Returns:
-//   - error: reports validation, dependency, cancellation, or persistence failures.
-func (a *App) Shutdown() error {
-	a.shutdownOnce.Do(func() {
-		a.ready.Store(false)
-		if a.runCancel != nil {
-			a.runCancel()
+//   - error: joins management server, Registry connection, and telemetry reader
+//     close failures; PostgreSQL close has no error result.
+func (c *Conformance) Shutdown() error {
+	c.shutdownOnce.Do(func() {
+		c.ready.Store(false)
+		if c.runCancel != nil {
+			c.runCancel()
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Service.ShutdownTimeout.Value())
+		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Service.ShutdownTimeout.Value())
 		defer cancel()
-		managementErr := a.managementServer.Shutdown(ctx)
+		managementErr := c.managementServer.Shutdown(ctx)
 		grpcDone := make(chan struct{})
 		go func() {
-			a.assignmentServer.GracefulStop()
+			c.assignmentServer.GracefulStop()
 			close(grpcDone)
 		}()
 		select {
 		case <-grpcDone:
 		case <-ctx.Done():
-			a.assignmentServer.Stop()
+			c.assignmentServer.Stop()
 			<-grpcDone
 		}
-		connectionErr := a.registryConnection.Close()
-		readerErr := a.reader.Close()
-		a.store.Close()
-		a.shutdownErr = errors.Join(managementErr, connectionErr, readerErr)
+		connectionErr := c.registryConnection.Close()
+		readerErr := c.reader.Close()
+		c.store.Close()
+		c.shutdownErr = errors.Join(managementErr, connectionErr, readerErr)
 	})
-	return a.shutdownErr
+	return c.shutdownErr
 }

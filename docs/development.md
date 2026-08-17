@@ -2,7 +2,8 @@
 
 The prototype targets Go 1.24 and follows the single-binary conventions used by
 Aero Arc Relay while improving strict configuration, lifecycle ownership,
-management server timeouts, and race coverage.
+management server timeouts, and race coverage. The binary uses `urfave/cli/v3`
+for its command and flag contract.
 
 ## Checks
 
@@ -27,7 +28,7 @@ worker fencing. Docker availability is the only reason they may skip locally.
 - `internal/transport/grpc`: assignment lifecycle transport adapter.
 - `internal/projection/registry`: leased durable Registry publication.
 - `internal/store/postgres`: migrations and atomic persistence operations.
-- `internal/app`: process lifecycle and management endpoints.
+- `internal/conformance`: Conformance service lifecycle and management endpoints.
 - `internal/integration`: multi-dependency behavior tests.
 - `internal/testsupport`: integration-only container ownership.
 
