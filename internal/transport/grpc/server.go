@@ -32,14 +32,15 @@ type AssignmentStore interface {
 	GetAssignment(context.Context, string, uint64) (domain.AssignmentRecord, error)
 }
 
-// Server adapts generated Conformance RPCs to the durable assignment store.
-type Server struct {
+// ConformanceServer adapts generated Conformance RPCs to the durable assignment
+// store.
+type ConformanceServer struct {
 	conformancev1.UnimplementedConformanceServiceServer
 	store      AssignmentStore
 	grpcServer *gogrpc.Server
 }
 
-var _ conformancev1.ConformanceServiceServer = (*Server)(nil)
+var _ conformancev1.ConformanceServiceServer = (*ConformanceServer)(nil)
 
 // New constructs an assignment lifecycle gRPC server.
 //
@@ -50,11 +51,11 @@ var _ conformancev1.ConformanceServiceServer = (*Server)(nil)
 // Returns:
 //   - server: is registered with reflection and ready to serve.
 //   - error: reports a missing durable store.
-func New(store AssignmentStore, options ...gogrpc.ServerOption) (*Server, error) {
+func New(store AssignmentStore, options ...gogrpc.ServerOption) (*ConformanceServer, error) {
 	if store == nil {
 		return nil, fmt.Errorf("assignment store is required")
 	}
-	server := &Server{store: store, grpcServer: gogrpc.NewServer(options...)}
+	server := &ConformanceServer{store: store, grpcServer: gogrpc.NewServer(options...)}
 	conformancev1.RegisterConformanceServiceServer(server.grpcServer, server)
 	reflection.Register(server.grpcServer)
 	return server, nil
@@ -67,16 +68,16 @@ func New(store AssignmentStore, options ...gogrpc.ServerOption) (*Server, error)
 //
 // Returns:
 //   - error: reports terminal listener or transport failure.
-func (s *Server) Serve(listener net.Listener) error { return s.grpcServer.Serve(listener) }
+func (s *ConformanceServer) Serve(listener net.Listener) error { return s.grpcServer.Serve(listener) }
 
 // GracefulStop stops accepting RPCs and waits for active lifecycle commands.
 // It is intended for the normal process shutdown path and returns only after
 // all in-flight handlers have completed.
-func (s *Server) GracefulStop() { s.grpcServer.GracefulStop() }
+func (s *ConformanceServer) GracefulStop() { s.grpcServer.GracefulStop() }
 
 // Stop immediately terminates the gRPC server during a bounded shutdown
 // fallback. Active handlers may observe transport cancellation.
-func (s *Server) Stop() { s.grpcServer.Stop() }
+func (s *ConformanceServer) Stop() { s.grpcServer.Stop() }
 
 // PrepareAssignment durably stores an immutable candidate without granting
 // evaluation authority.
@@ -88,7 +89,7 @@ func (s *Server) Stop() { s.grpcServer.Stop() }
 // Returns:
 //   - response: contains the applied or idempotently replayed candidate.
 //   - error: reports validation, command conflicts, or store failure as gRPC status.
-func (s *Server) PrepareAssignment(ctx context.Context, request *conformancev1.PrepareAssignmentRequest) (*conformancev1.PrepareAssignmentResponse, error) {
+func (s *ConformanceServer) PrepareAssignment(ctx context.Context, request *conformancev1.PrepareAssignmentRequest) (*conformancev1.PrepareAssignmentResponse, error) {
 	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" {
 		return nil, status.Error(codes.InvalidArgument, "source and message_id are required")
 	}
@@ -117,7 +118,7 @@ func (s *Server) PrepareAssignment(ctx context.Context, request *conformancev1.P
 // Returns:
 //   - response: contains the resulting immutable assignment record.
 //   - error: reports validation, fencing, or store failure as gRPC status.
-func (s *Server) CancelAssignmentCandidate(ctx context.Context, request *conformancev1.CancelAssignmentCandidateRequest) (*conformancev1.CancelAssignmentCandidateResponse, error) {
+func (s *ConformanceServer) CancelAssignmentCandidate(ctx context.Context, request *conformancev1.CancelAssignmentCandidateRequest) (*conformancev1.CancelAssignmentCandidateResponse, error) {
 	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || request.GetAssignmentGeneration() == 0 {
 		return nil, status.Error(codes.InvalidArgument, "source, message_id, assignment_id, and assignment_generation are required")
 	}
@@ -138,7 +139,7 @@ func (s *Server) CancelAssignmentCandidate(ctx context.Context, request *conform
 // Returns:
 //   - response: contains the newly active immutable assignment record.
 //   - error: reports validation, lifecycle fencing, or store failure as gRPC status.
-func (s *Server) CutoverAssignment(ctx context.Context, request *conformancev1.CutoverAssignmentRequest) (*conformancev1.CutoverAssignmentResponse, error) {
+func (s *ConformanceServer) CutoverAssignment(ctx context.Context, request *conformancev1.CutoverAssignmentRequest) (*conformancev1.CutoverAssignmentResponse, error) {
 	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || request.GetAssignmentGeneration() == 0 {
 		return nil, status.Error(codes.InvalidArgument, "source, message_id, assignment_id, and assignment_generation are required")
 	}
@@ -162,7 +163,7 @@ func (s *Server) CutoverAssignment(ctx context.Context, request *conformancev1.C
 // Returns:
 //   - response: contains the immutable assignment and current lifecycle metadata.
 //   - error: reports validation, absence, or store failure as gRPC status.
-func (s *Server) GetAssignment(ctx context.Context, request *conformancev1.GetAssignmentRequest) (*conformancev1.GetAssignmentResponse, error) {
+func (s *ConformanceServer) GetAssignment(ctx context.Context, request *conformancev1.GetAssignmentRequest) (*conformancev1.GetAssignmentResponse, error) {
 	if strings.TrimSpace(request.GetAssignmentId()) == "" || request.GetAssignmentGeneration() == 0 {
 		return nil, status.Error(codes.InvalidArgument, "assignment_id and assignment_generation are required")
 	}
