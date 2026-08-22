@@ -62,7 +62,9 @@ func NewAssignmentHandler(store AssignmentStore) (*AssignmentHandler, error) {
 //   - request: contains the idempotency identity and immutable assignment.
 //
 // Returns:
-//   - response: contains the applied or idempotently replayed candidate.
+//   - response: contains the applied or idempotently replayed candidate; a
+//     stale response omits the assignment record because that generation was
+//     deliberately not stored.
 //   - error: reports validation, command conflicts, or store failure as gRPC status.
 func (s *AssignmentHandler) PrepareAssignment(ctx context.Context, request *conformancev1.PrepareAssignmentRequest) (*conformancev1.PrepareAssignmentResponse, error) {
 	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" {
@@ -76,11 +78,16 @@ func (s *AssignmentHandler) PrepareAssignment(ctx context.Context, request *conf
 	if err != nil {
 		return nil, assignmentStatusError(err)
 	}
+	response := &conformancev1.PrepareAssignmentResponse{Disposition: dispositionToProto(result.Disposition)}
+	if result.Disposition == postgresstore.ApplyStale {
+		return response, nil
+	}
 	record, err := s.store.GetAssignment(ctx, result.Assignment.ID, result.Assignment.Generation)
 	if err != nil {
 		return nil, assignmentStatusError(err)
 	}
-	return &conformancev1.PrepareAssignmentResponse{Disposition: dispositionToProto(result.Disposition), Assignment: assignmentRecordToProto(record)}, nil
+	response.Assignment = assignmentRecordToProto(record)
+	return response, nil
 }
 
 // CancelAssignmentCandidate cancels only the selected received or armed

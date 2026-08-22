@@ -18,14 +18,21 @@ import (
 )
 
 type assignmentStoreStub struct {
-	prepared domain.Assignment
-	record   domain.AssignmentRecord
-	err      error
+	prepared           domain.Assignment
+	record             domain.AssignmentRecord
+	prepareDisposition postgresstore.ApplyDisposition
+	getCalls           int
+	getErr             error
+	err                error
 }
 
 func (s *assignmentStoreStub) PrepareAssignment(_ context.Context, _, _, _ string, assignment domain.Assignment) (postgresstore.ApplyResult, error) {
 	s.prepared = assignment
-	return postgresstore.ApplyResult{Disposition: postgresstore.ApplyApplied, Assignment: assignment}, s.err
+	disposition := s.prepareDisposition
+	if disposition == "" {
+		disposition = postgresstore.ApplyApplied
+	}
+	return postgresstore.ApplyResult{Disposition: disposition, Assignment: assignment}, s.err
 }
 func (s *assignmentStoreStub) CancelCandidate(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error) {
 	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
@@ -34,6 +41,10 @@ func (s *assignmentStoreStub) CutoverAssignment(context.Context, string, string,
 	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
 }
 func (s *assignmentStoreStub) GetAssignment(context.Context, string, uint64) (domain.AssignmentRecord, error) {
+	s.getCalls++
+	if s.getErr != nil {
+		return domain.AssignmentRecord{}, s.getErr
+	}
 	if s.err != nil {
 		return domain.AssignmentRecord{}, s.err
 	}
@@ -41,6 +52,29 @@ func (s *assignmentStoreStub) GetAssignment(context.Context, string, uint64) (do
 		return domain.AssignmentRecord{Assignment: s.prepared, Lifecycle: domain.AssignmentReceived}, nil
 	}
 	return s.record, nil
+}
+
+func TestPrepareAssignmentReturnsStaleWithoutStoredRecord(t *testing.T) {
+	store := &assignmentStoreStub{prepareDisposition: postgresstore.ApplyStale, getErr: postgresstore.ErrAssignmentNotFound}
+	handler, err := NewAssignmentHandler(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	response, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{
+		Source: "api", MessageId: "stale-message",
+		Assignment: &conformancev1.Assignment{
+			AssignmentId: "assignment-1", AssignmentGeneration: 6, AircraftId: "aircraft-1", AgentId: "agent-1",
+			FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2, PolicyVersion: "standard-v1",
+			EffectiveFrom: timestamppb.New(now), EffectiveUntil: timestamppb.New(now.Add(time.Hour)),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetDisposition() != conformancev1.AssignmentCommandDisposition_ASSIGNMENT_COMMAND_DISPOSITION_STALE || response.GetAssignment() != nil || store.getCalls != 0 {
+		t.Fatalf("response=%+v GetAssignment calls=%d", response, store.getCalls)
+	}
 }
 
 func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {

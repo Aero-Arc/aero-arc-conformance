@@ -104,7 +104,9 @@ type ApplyResult struct {
 //   - assignment: is the immutable candidate generation and specification.
 //
 // Returns:
-//   - result: distinguishes applied, idempotent, and stale delivery outcomes.
+//   - result: distinguishes applied, idempotent, and stale delivery outcomes;
+//     replaying a stale command returns stale again because no assignment row
+//     exists for that rejected generation.
 //   - error: reports invalid identity/specification, conflicting message reuse,
 //     immutable-identity changes, or transaction failure.
 func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
@@ -138,16 +140,24 @@ func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messag
 		return ApplyResult{}, fmt.Errorf("lock assignment: %w", err)
 	}
 
-	var existingHash string
-	err = tx.QueryRow(ctx, `SELECT payload_sha256 FROM conformance_inbox WHERE source=$1 AND message_id=$2 FOR UPDATE`, source, messageID).Scan(&existingHash)
+	var existingHash, existingDisposition string
+	err = tx.QueryRow(ctx, `SELECT payload_sha256,COALESCE(outcome->>'disposition','') FROM conformance_inbox WHERE source=$1 AND message_id=$2 FOR UPDATE`, source, messageID).Scan(&existingHash, &existingDisposition)
 	if err == nil {
 		if existingHash != hash {
 			return ApplyResult{}, ErrMessageConflict
 		}
+		disposition := ApplyIdempotent
+		switch ApplyDisposition(existingDisposition) {
+		case ApplyStale:
+			disposition = ApplyStale
+		case ApplyApplied, ApplyIdempotent:
+		default:
+			return ApplyResult{}, fmt.Errorf("stored assignment outcome is invalid")
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ApplyResult{}, err
 		}
-		return ApplyResult{Disposition: ApplyIdempotent, Assignment: assignment}, nil
+		return ApplyResult{Disposition: disposition, Assignment: assignment}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return ApplyResult{}, fmt.Errorf("read inbox: %w", err)

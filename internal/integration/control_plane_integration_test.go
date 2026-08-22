@@ -81,7 +81,7 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 
 	now := time.Now().UTC()
 	assignment := &conformancev1.Assignment{
-		AssignmentId: "assignment-control-plane", AssignmentGeneration: 1,
+		AssignmentId: "assignment-control-plane", AssignmentGeneration: 2,
 		OperatorId: "operator-1", AircraftId: "aircraft-1", AgentId: "agent-1",
 		FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 1, PolicyVersion: "standard-v1",
 		EffectiveFrom: timestamppb.New(now.Add(-time.Hour)), EffectiveUntil: timestamppb.New(now.Add(time.Hour)),
@@ -101,6 +101,14 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 	read, err := assignmentClient.GetAssignment(ctx, &conformancev1.GetAssignmentRequest{AssignmentId: assignment.GetAssignmentId(), AssignmentGeneration: assignment.GetAssignmentGeneration()})
 	if err != nil || !read.GetAssignment().GetAuthorityFrom().AsTime().Equal(cutoverAt) {
 		t.Fatalf("GetAssignment() = %+v, error = %v", read, err)
+	}
+	staleAssignment := proto.Clone(assignment).(*conformancev1.Assignment)
+	staleAssignment.AssignmentGeneration = 1
+	for attempt := 1; attempt <= 2; attempt++ {
+		stale, staleErr := assignmentClient.PrepareAssignment(ctx, &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "stale-prepare-1", Assignment: staleAssignment})
+		if staleErr != nil || stale.GetDisposition() != conformancev1.AssignmentCommandDisposition_ASSIGNMENT_COMMAND_DISPOSITION_STALE || stale.GetAssignment() != nil {
+			t.Fatalf("stale PrepareAssignment() attempt %d = %+v, error = %v", attempt, stale, staleErr)
+		}
 	}
 
 	claims, err := store.ClaimDueAssignments(ctx, "evaluation-worker", time.Minute, 1)
@@ -146,7 +154,7 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 		t.Fatalf("publisher.Flush() processed=%d error=%v", processed, err)
 	}
 	published := registryService.summary()
-	if published.GetAssignmentId() != assignment.GetAssignmentId() || published.GetAssignmentGeneration() != 1 || published.GetEvaluationRevision() != 1 || published.GetRecordingStatus() != conformancev1.RecordingStatus_RECORDING_STATUS_CONFIRMED {
+	if published.GetAssignmentId() != assignment.GetAssignmentId() || published.GetAssignmentGeneration() != assignment.GetAssignmentGeneration() || published.GetEvaluationRevision() != 1 || published.GetRecordingStatus() != conformancev1.RecordingStatus_RECORDING_STATUS_CONFIRMED {
 		t.Fatalf("published summary = %+v", published)
 	}
 	pool, err := pgxpool.New(ctx, dsn)
