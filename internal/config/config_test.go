@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +29,7 @@ func TestValidateRejectsUnsafePolicyAndLogging(t *testing.T) {
 	cfg.Influx.Database = "telemetry"
 	cfg.Registry.Address = "registry:50051"
 	cfg.Worker.ID = "worker"
+	cfg.Service.GRPCTLS = GRPCTLS{CertificateFile: "server.crt", PrivateKeyFile: "server.key", ClientCAFile: "api-ca.crt"}
 	cfg.Policy.HorizontalToleranceM = math.NaN()
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("NaN tolerance was accepted")
@@ -52,5 +54,21 @@ func TestDefaultRequiresDependencies(t *testing.T) {
 	cfg := Default()
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("empty dependency configuration accepted")
+	}
+}
+
+func TestValidateRequiresAssignmentMutualTLS(t *testing.T) {
+	cfg := Default()
+	cfg.Postgres.URL = "postgres://example"
+	cfg.Influx.Host = "http://example"
+	cfg.Influx.Database = "telemetry"
+	cfg.Registry.Address = "registry:50051"
+	cfg.Worker.ID = "worker"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "service.grpc_tls") {
+		t.Fatalf("missing assignment mTLS error = %v", err)
+	}
+	cfg.Service.GRPCTLS = GRPCTLS{CertificateFile: "server.crt", PrivateKeyFile: "server.key", ClientCAFile: "api-ca.crt"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid assignment mTLS configuration: %v", err)
 	}
 }

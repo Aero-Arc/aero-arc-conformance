@@ -9,11 +9,13 @@ package conformance
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,10 +64,15 @@ type Conformance struct {
 // Returns:
 //   - conformance: owns all opened process resources and is ready to run; no
 //     assignment or evaluation authority is changed during construction.
-//   - error: reports PostgreSQL, telemetry reader, assignment server, Registry
-//     connection, or publisher initialization failure. Resources opened before
-//     a failure are closed before the error is returned.
+//   - error: reports assignment mTLS credentials, PostgreSQL, telemetry reader,
+//     assignment server, Registry connection, or publisher initialization
+//     failure. Resources opened before a failure are closed before the error is
+//     returned.
 func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance, error) {
+	assignmentCredentials, err := newAssignmentServerCredentials(cfg.Service.GRPCTLS)
+	if err != nil {
+		return nil, err
+	}
 	store, err := postgresstore.Open(ctx, cfg.Postgres.URL)
 	if err != nil {
 		return nil, err
@@ -81,7 +88,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance
 		store.Close()
 		return nil, err
 	}
-	grpcServer := gogrpc.NewServer()
+	grpcServer := gogrpc.NewServer(gogrpc.Creds(assignmentCredentials))
 	conformancev1.RegisterConformanceServiceServer(grpcServer, assignmentHandler)
 	reflection.Register(grpcServer)
 	var transportCredentials credentials.TransportCredentials
@@ -118,6 +125,27 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance
 	conformance.managementServer = &http.Server{Addr: cfg.Service.ManagementAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	conformance.ready.Store(true)
 	return conformance, nil
+}
+
+func newAssignmentServerCredentials(cfg config.GRPCTLS) (credentials.TransportCredentials, error) {
+	certificate, err := tls.LoadX509KeyPair(cfg.CertificateFile, cfg.PrivateKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load assignment gRPC server certificate: %w", err)
+	}
+	clientCAPEM, err := os.ReadFile(cfg.ClientCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("read assignment gRPC client CA: %w", err)
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
+		return nil, fmt.Errorf("assignment gRPC client CA contains no certificates")
+	}
+	return credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+		MinVersion:   tls.VersionTLS12,
+	}), nil
 }
 
 // Run serves management and assignment gRPC endpoints while publishing the

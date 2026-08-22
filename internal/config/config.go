@@ -52,7 +52,13 @@ func (d Duration) Value() time.Duration { return time.Duration(d) }
 type Service struct {
 	ManagementAddress string   `yaml:"management_address"`
 	GRPCAddress       string   `yaml:"grpc_address"`
+	GRPCTLS           GRPCTLS  `yaml:"grpc_tls"`
 	ShutdownTimeout   Duration `yaml:"shutdown_timeout"`
+}
+type GRPCTLS struct {
+	CertificateFile string `yaml:"certificate_file"`
+	PrivateKeyFile  string `yaml:"private_key_file"`
+	ClientCAFile    string `yaml:"client_ca_file"`
 }
 type Registry struct {
 	Address         string   `yaml:"address"`
@@ -142,6 +148,9 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Service.ManagementAddress) == "" || strings.TrimSpace(c.Service.GRPCAddress) == "" || c.Service.ShutdownTimeout <= 0 {
 		return fmt.Errorf("service management/grpc addresses and positive shutdown timeout are required")
+	}
+	if strings.TrimSpace(c.Service.GRPCTLS.CertificateFile) == "" || strings.TrimSpace(c.Service.GRPCTLS.PrivateKeyFile) == "" || strings.TrimSpace(c.Service.GRPCTLS.ClientCAFile) == "" {
+		return fmt.Errorf("service.grpc_tls certificate, private key, and client CA files are required")
 	}
 	if strings.TrimSpace(c.Postgres.URL) == "" {
 		return fmt.Errorf("postgres.url is required")

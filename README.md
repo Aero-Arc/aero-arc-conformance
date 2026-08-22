@@ -48,6 +48,10 @@ Requirements: Go 1.24 or newer and Docker for integration tests.
 
 ```bash
 cp configs/config.yaml.example configs/config.yaml
+# Populate configs/tls/tls.crt, tls.key, and client-ca.crt for assignment mTLS.
+export AERO_CONFORMANCE_GRPC_CERTIFICATE_FILE="$PWD/configs/tls/tls.crt"
+export AERO_CONFORMANCE_GRPC_PRIVATE_KEY_FILE="$PWD/configs/tls/tls.key"
+export AERO_CONFORMANCE_GRPC_CLIENT_CA_FILE="$PWD/configs/tls/client-ca.crt"
 go test ./...
 go test -race ./...
 go test -tags=integration -timeout=10m ./internal/integration
@@ -58,7 +62,8 @@ go run ./cmd/aero-arc-conformance --config-path configs/config.yaml
 Registry outbox rows. It will not evaluate telemetry until the worker runtime
 slice lands and Relay supplies the required `wal_id` contract.
 
-Assignment gRPC defaults to `:50052`. Management endpoints default to:
+Assignment gRPC defaults to `:50052` and requires an API client certificate
+signed by the configured client CA. Management endpoints default to:
 
 - `GET /healthz` — process liveness.
 - `GET /readyz` — initialized process with reachable PostgreSQL.

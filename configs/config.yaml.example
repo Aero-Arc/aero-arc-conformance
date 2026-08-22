@@ -1,6 +1,10 @@
 service:
   management_address: ":2112"
   grpc_address: ":50052"
+  grpc_tls:
+    certificate_file: "${AERO_CONFORMANCE_GRPC_CERTIFICATE_FILE}"
+    private_key_file: "${AERO_CONFORMANCE_GRPC_PRIVATE_KEY_FILE}"
+    client_ca_file: "${AERO_CONFORMANCE_GRPC_CLIENT_CA_FILE}"
   shutdown_timeout: 15s
 
 postgres:

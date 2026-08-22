@@ -50,6 +50,11 @@ Relay writes telemetry independently. Conformance cannot enter Relay's ACK path.
 This is a saga, not a distributed transaction. Every stage must be idempotent,
 observable, and reconcilable.
 
+The API-to-Conformance assignment channel is mutually authenticated with TLS.
+Conformance verifies the API client certificate against its configured client
+CA before dispatching lifecycle RPCs; the command `source` only namespaces
+idempotency and does not establish caller identity.
+
 Replacement intents use the same lifecycle as a blue-green deployment. The
 current generation stays authoritative and claimable while a higher generation
 is received and armed. The API emits the cutover only after its local intent

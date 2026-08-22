@@ -15,6 +15,13 @@ Current graceful shutdown stops readiness, assignment gRPC, Registry delivery,
 management HTTP, and clients within a bounded timeout. The worker slice must
 extend this to stop new telemetry claims and fence active evaluation work.
 
+The assignment gRPC listener requires a server certificate/private key and a
+client CA. API callers must present a certificate chaining to that CA; startup
+fails if any credential is absent or invalid. Use a CA dedicated to authorized
+API clients, rotate credentials through mounted secrets plus a controlled
+restart, and retain network policy as defense in depth. Never treat the
+caller-provided assignment `source` as workload identity.
+
 Assignment replacements roll out through
 `candidate_received → candidate_armed → active`.
 Deploy the Conformance schema/store support across the fleet before an API
