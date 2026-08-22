@@ -101,7 +101,7 @@ func (s *AssignmentHandler) PrepareAssignment(ctx context.Context, request *conf
 //   - response: contains the resulting immutable assignment record.
 //   - error: reports validation, fencing, or store failure as gRPC status.
 func (s *AssignmentHandler) CancelAssignmentCandidate(ctx context.Context, request *conformancev1.CancelAssignmentCandidateRequest) (*conformancev1.CancelAssignmentCandidateResponse, error) {
-	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || request.GetAssignmentGeneration() == 0 {
+	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || !validAssignmentGeneration(request.GetAssignmentGeneration()) {
 		return nil, status.Error(codes.InvalidArgument, "source, message_id, assignment_id, and assignment_generation are required")
 	}
 	result, err := s.store.CancelCandidate(ctx, request.GetSource(), request.GetMessageId(), request.GetAssignmentId(), request.GetAssignmentGeneration())
@@ -122,11 +122,14 @@ func (s *AssignmentHandler) CancelAssignmentCandidate(ctx context.Context, reque
 //   - response: contains the newly active immutable assignment record.
 //   - error: reports validation, lifecycle fencing, or store failure as gRPC status.
 func (s *AssignmentHandler) CutoverAssignment(ctx context.Context, request *conformancev1.CutoverAssignmentRequest) (*conformancev1.CutoverAssignmentResponse, error) {
-	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || request.GetAssignmentGeneration() == 0 {
+	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || !validAssignmentGeneration(request.GetAssignmentGeneration()) {
 		return nil, status.Error(codes.InvalidArgument, "source, message_id, assignment_id, and assignment_generation are required")
 	}
 	if request.GetEffectiveAt() == nil || request.GetEffectiveAt().CheckValid() != nil {
 		return nil, status.Error(codes.InvalidArgument, "effective_at is required and must be valid")
+	}
+	if !supportedUnixNanoseconds(request.GetEffectiveAt().AsTime()) {
+		return nil, status.Error(codes.InvalidArgument, "effective_at is outside the supported nanosecond timestamp range")
 	}
 	result, err := s.store.CutoverAssignment(ctx, request.GetSource(), request.GetMessageId(), request.GetAssignmentId(), request.GetAssignmentGeneration(), request.GetEffectiveAt().AsTime())
 	if err != nil {
@@ -146,7 +149,7 @@ func (s *AssignmentHandler) CutoverAssignment(ctx context.Context, request *conf
 //   - response: contains the immutable assignment and current lifecycle metadata.
 //   - error: reports validation, absence, or store failure as gRPC status.
 func (s *AssignmentHandler) GetAssignment(ctx context.Context, request *conformancev1.GetAssignmentRequest) (*conformancev1.GetAssignmentResponse, error) {
-	if strings.TrimSpace(request.GetAssignmentId()) == "" || request.GetAssignmentGeneration() == 0 {
+	if strings.TrimSpace(request.GetAssignmentId()) == "" || !validAssignmentGeneration(request.GetAssignmentGeneration()) {
 		return nil, status.Error(codes.InvalidArgument, "assignment_id and assignment_generation are required")
 	}
 	record, err := s.store.GetAssignment(ctx, request.GetAssignmentId(), request.GetAssignmentGeneration())
@@ -190,10 +193,18 @@ func assignmentFromProto(value *conformancev1.Assignment) (domain.Assignment, er
 		}
 		assignment.Volumes = append(assignment.Volumes, volume)
 	}
-	if strings.TrimSpace(assignment.ID) == "" || assignment.Generation == 0 || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) {
+	if strings.TrimSpace(assignment.ID) == "" || !validAssignmentGeneration(assignment.Generation) || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) {
 		return domain.Assignment{}, fmt.Errorf("assignment identity and effective window are invalid")
 	}
 	return assignment, nil
+}
+
+func validAssignmentGeneration(generation uint64) bool {
+	return generation > 0 && generation <= math.MaxInt64
+}
+
+func supportedUnixNanoseconds(value time.Time) bool {
+	return value.Year() >= 1678 && value.Year() <= 2261
 }
 
 func assignmentRecordToProto(record domain.AssignmentRecord) *conformancev1.AssignmentRecord {

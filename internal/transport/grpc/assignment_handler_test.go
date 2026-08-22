@@ -6,6 +6,7 @@ package grpc
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -98,6 +99,56 @@ func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {
 	}
 	if store.prepared.Generation != 7 || len(store.prepared.Volumes) != 1 || response.GetAssignment().GetLifecycle() != conformancev1.AssignmentLifecycle_ASSIGNMENT_LIFECYCLE_CANDIDATE_RECEIVED {
 		t.Fatalf("prepared=%+v response=%+v", store.prepared, response)
+	}
+}
+
+func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
+	handler, err := NewAssignmentHandler(&assignmentStoreStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	overflowGeneration := uint64(math.MaxInt64) + 1
+	overflowTime := time.Date(2262, time.January, 1, 0, 0, 0, 0, time.UTC)
+	validAssignment := func(generation uint64, effectiveFrom, effectiveUntil time.Time) *conformancev1.Assignment {
+		return &conformancev1.Assignment{
+			AssignmentId: "assignment-1", AssignmentGeneration: generation, AircraftId: "aircraft-1", AgentId: "agent-1",
+			FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2, PolicyVersion: "standard-v1",
+			EffectiveFrom: timestamppb.New(effectiveFrom), EffectiveUntil: timestamppb.New(effectiveUntil),
+		}
+	}
+	tests := map[string]func() error{
+		"prepare generation": func() error {
+			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-generation", Assignment: validAssignment(overflowGeneration, now, now.Add(time.Hour))})
+			return err
+		},
+		"prepare timestamp": func() error {
+			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-time", Assignment: validAssignment(1, overflowTime, overflowTime.Add(time.Hour))})
+			return err
+		},
+		"cancel generation": func() error {
+			_, err := handler.CancelAssignmentCandidate(context.Background(), &conformancev1.CancelAssignmentCandidateRequest{Source: "api", MessageId: "cancel-generation", AssignmentId: "assignment-1", AssignmentGeneration: overflowGeneration})
+			return err
+		},
+		"cutover generation": func() error {
+			_, err := handler.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{Source: "api", MessageId: "cutover-generation", AssignmentId: "assignment-1", AssignmentGeneration: overflowGeneration, EffectiveAt: timestamppb.New(now)})
+			return err
+		},
+		"cutover timestamp": func() error {
+			_, err := handler.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{Source: "api", MessageId: "cutover-time", AssignmentId: "assignment-1", AssignmentGeneration: 1, EffectiveAt: timestamppb.New(overflowTime)})
+			return err
+		},
+		"get generation": func() error {
+			_, err := handler.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: overflowGeneration})
+			return err
+		},
+	}
+	for name, run := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := run(); status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("error = %v, want InvalidArgument", err)
+			}
+		})
 	}
 }
 
