@@ -21,10 +21,12 @@ import (
 	"time"
 
 	"github.com/aero-arc/aero-arc-conformance/internal/config"
+	"github.com/aero-arc/aero-arc-conformance/internal/evaluator"
 	registryprojection "github.com/aero-arc/aero-arc-conformance/internal/projection/registry"
 	postgresstore "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
 	telemetryinflux "github.com/aero-arc/aero-arc-conformance/internal/telemetry/influx"
 	conformancegrpc "github.com/aero-arc/aero-arc-conformance/internal/transport/grpc"
+	evaluationworker "github.com/aero-arc/aero-arc-conformance/internal/worker"
 	conformancev1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
 	registryv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/registry/v1"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -45,6 +47,7 @@ type Conformance struct {
 	grpcServer         *gogrpc.Server
 	registryConnection *gogrpc.ClientConn
 	publisher          *registryprojection.Publisher
+	evaluationWorker   *evaluationworker.Worker
 	runCancel          context.CancelFunc
 	ready              atomic.Bool
 	shutdownOnce       sync.Once
@@ -114,8 +117,30 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance
 		store.Close()
 		return nil, err
 	}
+	engine, err := evaluator.New(evaluator.Policy{
+		Version: cfg.Policy.Version, HorizontalToleranceM: cfg.Policy.HorizontalToleranceM,
+		VerticalToleranceM: cfg.Policy.VerticalToleranceM, OpenAfterSamples: cfg.Policy.OpenAfterSamples,
+		RecoverAfterSamples: cfg.Policy.RecoverAfterSamples, TelemetryFreshness: cfg.Policy.TelemetryFreshness.Value(),
+	})
+	if err != nil {
+		_ = registryConnection.Close()
+		_ = reader.Close()
+		store.Close()
+		return nil, fmt.Errorf("create evaluator: %w", err)
+	}
+	evaluationWorker, err := evaluationworker.New(store, reader, engine, evaluationworker.Config{
+		WorkerID: cfg.Worker.ID, PollInterval: cfg.Influx.PollInterval.Value(), LeaseDuration: cfg.Worker.LeaseDuration.Value(),
+		RenewInterval: cfg.Worker.RenewInterval.Value(), SettleDelay: cfg.Influx.SettleDelay.Value(),
+		OverlapWindow: cfg.Influx.OverlapWindow.Value(), ClaimBatchSize: cfg.Worker.ClaimBatchSize,
+	}, log)
+	if err != nil {
+		_ = registryConnection.Close()
+		_ = reader.Close()
+		store.Close()
+		return nil, fmt.Errorf("create evaluation worker: %w", err)
+	}
 	mux := http.NewServeMux()
-	conformance := &Conformance{cfg: cfg, log: log, store: store, reader: reader, grpcServer: grpcServer, registryConnection: registryConnection, publisher: publisher}
+	conformance := &Conformance{cfg: cfg, log: log, store: store, reader: reader, grpcServer: grpcServer, registryConnection: registryConnection, publisher: publisher, evaluationWorker: evaluationWorker}
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -169,7 +194,7 @@ func (c *Conformance) Run(ctx context.Context) error {
 		_ = c.Shutdown()
 		return fmt.Errorf("listen for assignment gRPC: %w", err)
 	}
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		if serveErr := c.managementServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
 			errCh <- fmt.Errorf("management server: %w", serveErr)
@@ -181,6 +206,11 @@ func (c *Conformance) Run(ctx context.Context) error {
 		}
 	}()
 	go func() { _ = c.publisher.Run(runCtx) }()
+	go func() {
+		if workerErr := c.evaluationWorker.Run(runCtx); workerErr != nil {
+			errCh <- fmt.Errorf("evaluation worker: %w", workerErr)
+		}
+	}()
 	select {
 	case <-runCtx.Done():
 		return c.Shutdown()

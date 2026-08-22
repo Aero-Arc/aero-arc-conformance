@@ -13,7 +13,9 @@ than placing private keys beside the configuration file.
 Important timing relationships:
 
 - worker renewal interval must be shorter than lease duration;
-- telemetry overlap must cover expected delayed visibility and restart delay;
+- telemetry overlap rereads recent evidence on restart and preserves a
+  same-timestamp suffix after the checkpoint cursor; it does not yet reconcile
+  newly visible observations older than that cursor;
 - settle delay trades live latency for reduced visibility reordering;
 - freshness governs monitoring availability, not geometric containment;
 - query `max_rows` is a completeness guard, not a performance target.
@@ -34,6 +36,19 @@ rejects a prepared assignment whose policy version differs from the policy
 loaded by the running process, rather than accepting work its evaluator cannot
 execute. Configuration is loaded at startup, so changing the accepted policy
 version requires a controlled service restart.
+
+The evaluator claims up to `worker.claim_batch_size` due assignments per
+`influx.poll_interval`. It queries only through `now - influx.settle_delay`,
+recursively splits any saturated half-open window, renews ownership every
+`worker.renew_interval`, and commits the next evaluation due time only with a
+complete non-empty suffix. Empty or failed reads release and reschedule the
+claim without advancing the durable checkpoint or evaluation revision. They do
+not yet publish a monitoring-only stale/unavailable revision; Registry TTL is
+the current fallback.
+After an authority interval ends, it remains claimable for the settle delay plus
+one poll interval so at least one scheduled query can reach the final
+`[last checkpoint, authority_until)` tail. This grace extends processing
+eligibility, never assignment authority.
 
 `registry.address` selects the Registry gRPC target; `registry.insecure` is
 intended only for trusted development networks. Production deployments should

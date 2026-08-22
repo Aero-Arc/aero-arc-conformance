@@ -95,9 +95,16 @@ polling therefore needs overlap plus one of these deterministic semantics:
 3. move live delivery to a durable ordered broker if measurements show polling
    cannot meet latency and completeness requirements.
 
-The preferred prototype direction is suffix replay because it preserves true
-event-time hysteresis. Checkpoint retention must exceed overlap plus maximum
-recovery delay.
+The runtime now restores the latest checkpoint, rereads the configured overlap,
+and evaluates only observations canonically after the durable cursor. This
+protects takeover and same-timestamp suffix progress without double-applying
+known frames. It deliberately does not claim to reconcile a newly visible frame
+whose event-time/cursor sorts behind the checkpoint: doing that correctly needs
+an earlier checkpoint or a processed-frame ledger and remains a production gate.
+An ended live interval remains claimable only for the configured settle delay
+plus one poll interval, allowing a scheduled final query capped at its exclusive
+authority end. The grace does not authorize later observations or permit a
+checkpoint outside the interval.
 
 ## Critical telemetry durability gap
 
@@ -118,6 +125,11 @@ It requires one same active 4D volume to satisfy lateral and vertical bounds;
 authorization from two different volumes cannot be combined. Telemetry silence
 is assessed separately by a poll-watermark timer so historical replay cannot
 manufacture freshness incidents.
+The evaluator exposes that assessment, but the runtime does not yet have a
+monitoring-only durable commit that can publish it without fabricating or
+regressing a telemetry cursor. Empty and failed reads therefore leave the last
+summary unchanged and rely on Registry TTL expiry; adding that independently
+fenced projection is still required for prompt stale/unavailable reporting.
 Each violation type has an independent state machine:
 
 ```text
@@ -181,8 +193,8 @@ After a worker dies:
 1. the Registry projection ages to stale;
 2. the lease expires;
 3. another worker claims a higher generation;
-4. it loads an earlier retained checkpoint and open incident state;
-5. it rereads the overlapping Influx window and replays deterministically;
+4. it loads the latest checkpoint and retained incident state;
+5. it rereads the overlapping Influx window and evaluates the canonical suffix;
 6. it atomically commits and republishes current state;
 7. any resumed old worker is rejected by both Postgres and Registry fencing.
 
@@ -208,8 +220,9 @@ whether a `FailedPrecondition` means a higher cursor already won or the same
 cursor conflicts, so Conformance does not discard durable delivery evidence on
 an ambiguous rejection.
 
-Conformance publishes meaningful state transitions, severity changes, recording
-changes, and periodic freshness—not every telemetry frame.
+The current runtime commits and enqueues one Registry projection for every
+non-empty polled suffix. Publication coalescing and a separate heartbeat cadence
+are scaling work; the outbox publisher preserves every committed revision today.
 
 ## Failure principles
 
@@ -245,8 +258,8 @@ Before treating the current cross-repository contracts as production-ready, prov
 3. Agent creates and transmits `wal_id`.
 4. Relay persists `wal_id` and closes the acknowledged-loss gap.
 5. Registry implements assignment fencing and TTL live projection.
-6. Conformance wires the assignment server and projection outbox; the telemetry
-   worker loop follows after the reader gates are satisfied.
+6. Conformance wires the assignment server, live telemetry worker, and projection
+   outbox; deployment remains gated on the reader's WAL identity contract.
 7. API adds assignment outbox, readiness gating, and live/durable composition.
 8. Ops displays the three status axes and incident detail.
 9. A SITL system test proves breach, recovery, persistence degradation, and

@@ -639,6 +639,9 @@ func recordLifecycleCommand(ctx context.Context, tx pgx.Tx, source, messageID, m
 
 type Claim struct {
 	Assignment         domain.Assignment
+	AuthorityFrom      time.Time
+	AuthorityUntil     time.Time
+	FinalizationGrace  time.Duration
 	WorkerID           string
 	LeaseGeneration    uint64
 	LeaseUntil         time.Time
@@ -658,18 +661,38 @@ type Claim struct {
 //   - claims: contain assignment, lease generation, expiry, and expected revision.
 //   - error: reports invalid arguments, database failure, or specification decoding.
 func (s *Store) ClaimDueAssignments(ctx context.Context, workerID string, lease time.Duration, limit int) ([]Claim, error) {
-	if workerID == "" || lease <= 0 || limit < 1 {
+	return s.ClaimDueAssignmentsWithFinalizationGrace(ctx, workerID, lease, 0, limit)
+}
+
+// ClaimDueAssignmentsWithFinalizationGrace atomically leases due live
+// assignments, including an ended authority interval only during a bounded
+// settle-and-scheduling grace so its final half-open telemetry tail can be queried.
+//
+// Parameters:
+//   - ctx: controls the claim transaction.
+//   - workerID: identifies the evaluator replica acquiring ownership.
+//   - lease: defines the PostgreSQL-clock ownership interval.
+//   - finalizationGrace: keeps an ended interval claimable only long enough for
+//     telemetry settling plus one scheduling interval; it never extends event authority.
+//   - limit: caps assignments claimed in one transaction.
+//
+// Returns:
+//   - claims: contain assignment, authority interval, independent lease fence,
+//     expected evaluation revision, and final-tail grace.
+//   - error: reports invalid arguments, database failure, or specification decoding.
+func (s *Store) ClaimDueAssignmentsWithFinalizationGrace(ctx context.Context, workerID string, lease, finalizationGrace time.Duration, limit int) ([]Claim, error) {
+	if workerID == "" || lease <= 0 || finalizationGrace < 0 || limit < 1 {
 		return nil, fmt.Errorf("claim arguments are invalid")
 	}
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 SELECT assignment_id,assignment_generation FROM conformance_assignments
-WHERE lifecycle_state IN ('active','ending') AND authority_until>now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
+WHERE lifecycle_state IN ('active','ending') AND authority_until+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
 ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
 FROM due WHERE a.assignment_id=due.assignment_id AND a.assignment_generation=due.assignment_generation
-RETURNING a.specification,a.lease_generation,a.lease_until,a.evaluation_revision)
-SELECT specification,lease_generation,lease_until,evaluation_revision FROM claimed`, limit, workerID, lease.String())
+RETURNING a.specification,a.authority_from,a.authority_until,a.lease_generation,a.lease_until,a.evaluation_revision)
+SELECT specification,authority_from,authority_until,lease_generation,lease_until,evaluation_revision FROM claimed`, limit, workerID, lease.String(), finalizationGrace.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim assignments: %w", err)
 	}
@@ -679,7 +702,8 @@ SELECT specification,lease_generation,lease_until,evaluation_revision FROM claim
 		var raw []byte
 		var c Claim
 		c.WorkerID = workerID
-		if err = rows.Scan(&raw, &c.LeaseGeneration, &c.LeaseUntil, &c.EvaluationRevision); err != nil {
+		c.FinalizationGrace = finalizationGrace
+		if err = rows.Scan(&raw, &c.AuthorityFrom, &c.AuthorityUntil, &c.LeaseGeneration, &c.LeaseUntil, &c.EvaluationRevision); err != nil {
 			return nil, err
 		}
 		if err = json.Unmarshal(raw, &c.Assignment); err != nil {
@@ -688,6 +712,33 @@ SELECT specification,lease_generation,lease_until,evaluation_revision FROM claim
 		claims = append(claims, c)
 	}
 	return claims, rows.Err()
+}
+
+// DeferAssignmentEvaluation releases a claimed assignment and moves its next
+// due time without advancing its evaluation revision or durable telemetry
+// watermark. It is used when no complete evaluable suffix is available.
+//
+// Parameters:
+//   - ctx: controls the fenced update.
+//   - claim: carries the exact worker and lease-generation ownership fences.
+//   - nextEvaluationAt: schedules the next attempt without recording evidence.
+//
+// Returns:
+//   - error: reports an invalid schedule, database failure, or ErrLeaseLost when
+//     the lease expired or any assignment, worker, generation, revision, or
+//     lifecycle fence no longer matches.
+func (s *Store) DeferAssignmentEvaluation(ctx context.Context, claim Claim, nextEvaluationAt time.Time) error {
+	if nextEvaluationAt.IsZero() {
+		return fmt.Errorf("next evaluation time is required")
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND authority_until+$7::interval>=now() AND lifecycle_state IN ('active','ending')`, nextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, claim.FinalizationGrace.String())
+	if err != nil {
+		return fmt.Errorf("defer assignment evaluation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 // RenewAssignmentLease extends an unexpired lease only when the caller still
@@ -705,7 +756,7 @@ func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND authority_until>now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration)
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND authority_until+$6::interval>=now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.FinalizationGrace.String())
 	if err != nil {
 		return fmt.Errorf("renew assignment lease: %w", err)
 	}

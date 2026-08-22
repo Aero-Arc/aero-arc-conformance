@@ -9,6 +9,8 @@ package integration
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	postgresstore "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
 	telemetryinflux "github.com/aero-arc/aero-arc-conformance/internal/telemetry/influx"
 	"github.com/aero-arc/aero-arc-conformance/internal/testsupport"
+	evaluationworker "github.com/aero-arc/aero-arc-conformance/internal/worker"
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -159,6 +162,76 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 	assertDurableEvaluation(t, ctx, pg.URL, "assignment-reclaim", 2, 2, 2)
 	if err = store.CommitEvaluation(ctx, stale, postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: now}); err != postgresstore.ErrLeaseLost {
 		t.Fatalf("stale commit err=%v", err)
+	}
+
+	// Exercise the production orchestration across both real dependencies: the
+	// worker claims PostgreSQL authority, waits for a complete Influx suffix,
+	// evaluates it, and atomically creates the Registry publication handoff.
+	workerNow := time.Now().UTC().Add(-3 * time.Second)
+	workerAssignment := assignment
+	workerAssignment.ID = "assignment-runtime-worker"
+	workerAssignment.EffectiveFrom = workerNow
+	workerAssignment.EffectiveUntil = workerNow.Add(time.Hour)
+	workerAssignment.Volumes[0].StartsAt = workerNow
+	workerAssignment.Volumes[0].EndsAt = workerNow.Add(time.Hour)
+	activateAssignment(t, ctx, store, workerAssignment, "runtime-worker", workerNow)
+	workerPoint := positionPoint(workerNow.Add(time.Second), "runtime-frame-1", 100, 35.005, -97.005, 100)
+	if err = client.WritePoints(ctx, []*influxdb3.Point{workerPoint}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		visible, readErr := reader.ReadPositions(ctx, []string{workerAssignment.AircraftID}, workerNow, workerNow.Add(2*time.Second))
+		if readErr == nil && len(visible.Observations) > 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	runtimeWorker, err := evaluationworker.New(store, reader, e, evaluationworker.Config{WorkerID: "runtime-worker", PollInterval: time.Second, LeaseDuration: 30 * time.Second, RenewInterval: 10 * time.Second, SettleDelay: 0, OverlapWindow: 30 * time.Second, ClaimBatchSize: 20}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = runtimeWorker.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertDurableEvaluation(t, ctx, pg.URL, workerAssignment.ID, 0, 0, 1)
+
+	tailStart := time.Now().UTC()
+	tailAssignment := workerAssignment
+	tailAssignment.ID = "assignment-final-settle-tail"
+	tailAssignment.EffectiveFrom = tailStart
+	tailAssignment.EffectiveUntil = tailStart.Add(300 * time.Millisecond)
+	tailAssignment.Volumes[0].StartsAt = tailAssignment.EffectiveFrom
+	tailAssignment.Volumes[0].EndsAt = tailAssignment.EffectiveUntil
+	activateAssignment(t, ctx, store, tailAssignment, "final-tail", tailStart)
+	time.Sleep(400 * time.Millisecond)
+	withoutGrace, err := store.ClaimDueAssignments(ctx, "tail-without-grace", 5*time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, claim := range withoutGrace {
+		if claim.Assignment.ID == tailAssignment.ID {
+			t.Fatal("ended assignment was claimed without finalization grace")
+		}
+	}
+	withGrace, err := store.ClaimDueAssignmentsWithFinalizationGrace(ctx, "tail-with-grace", 5*time.Second, 2*time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tailClaim postgresstore.Claim
+	for _, claim := range withGrace {
+		if claim.Assignment.ID == tailAssignment.ID {
+			tailClaim = claim
+		}
+	}
+	if tailClaim.Assignment.ID == "" || tailClaim.FinalizationGrace != 2*time.Second {
+		t.Fatalf("final tail was not claimable during settle grace: %#v", withGrace)
+	}
+	if err = store.DeferAssignmentEvaluation(ctx, tailClaim, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("release final-tail claim: %v", err)
 	}
 
 	t.Run("blue-green assignment cutover", func(t *testing.T) {
