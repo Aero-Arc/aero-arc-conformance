@@ -70,7 +70,7 @@ type Publisher struct {
 //   - error: reports missing dependencies or unsafe timing/batch configuration.
 func New(store Store, client Client, config Config, log *slog.Logger) (*Publisher, error) {
 	if store == nil || client == nil || log == nil || config.WorkerID == "" || config.PollInterval <= 0 || config.RequestTimeout <= 0 || config.LeaseDuration <= config.RequestTimeout || config.RetryDelay <= 0 || config.BatchSize < 1 {
-		return nil, fmt.Errorf("Registry publisher configuration is invalid")
+		return nil, fmt.Errorf("registry publisher configuration is invalid")
 	}
 	return &Publisher{store: store, client: client, config: config, log: log}, nil
 }
@@ -165,11 +165,11 @@ func (p *Publisher) scheduleRetry(ctx context.Context, claim postgresstore.Outbo
 
 func validateAcknowledgement(sent *conformancev1.ConformanceSummary, response *registryv1.PublishConformanceSummaryResponse) error {
 	if response == nil || response.GetProjection() == nil || response.GetProjection().GetSummary() == nil {
-		return fmt.Errorf("Registry acknowledgement omitted the accepted projection")
+		return fmt.Errorf("registry acknowledgement omitted the accepted projection")
 	}
 	accepted := response.GetProjection().GetSummary()
 	if accepted.GetAssignmentId() != sent.GetAssignmentId() || accepted.GetAssignmentGeneration() != sent.GetAssignmentGeneration() || accepted.GetEvaluationRevision() != sent.GetEvaluationRevision() || accepted.GetEvaluationId() != sent.GetEvaluationId() {
-		return fmt.Errorf("Registry acknowledgement did not match the exact evaluation cursor")
+		return fmt.Errorf("registry acknowledgement did not match the exact evaluation cursor")
 	}
 	return nil
 }
@@ -207,8 +207,10 @@ func optionalTime(value time.Time) *timestamppb.Timestamp {
 	return timestamppb.New(value)
 }
 
-var conditionToProto = map[domain.Condition]conformancev1.ConformanceCondition{domain.ConditionUnknown: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_UNKNOWN, domain.ConditionConforming: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_CONFORMING, domain.ConditionSuspected: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_SUSPECTED, domain.ConditionNonConforming: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_NON_CONFORMING, domain.ConditionRecovering: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_RECOVERING}
-var monitoringToProto = map[domain.MonitoringStatus]conformancev1.MonitoringStatus{domain.MonitoringReceived: conformancev1.MonitoringStatus_MONITORING_STATUS_RECEIVED, domain.MonitoringArmed: conformancev1.MonitoringStatus_MONITORING_STATUS_ARMED, domain.MonitoringCurrent: conformancev1.MonitoringStatus_MONITORING_STATUS_CURRENT, domain.MonitoringStale: conformancev1.MonitoringStatus_MONITORING_STATUS_STALE, domain.MonitoringUnavailable: conformancev1.MonitoringStatus_MONITORING_STATUS_UNAVAILABLE}
-var recordingToProto = map[domain.RecordingStatus]conformancev1.RecordingStatus{domain.RecordingPending: conformancev1.RecordingStatus_RECORDING_STATUS_PENDING, domain.RecordingConfirmed: conformancev1.RecordingStatus_RECORDING_STATUS_CONFIRMED, domain.RecordingDegraded: conformancev1.RecordingStatus_RECORDING_STATUS_DEGRADED}
-var violationToProto = map[domain.ViolationType]conformancev1.ViolationType{domain.ViolationLateral: conformancev1.ViolationType_VIOLATION_TYPE_LATERAL_DEVIATION, domain.ViolationVertical: conformancev1.ViolationType_VIOLATION_TYPE_ALTITUDE_DEVIATION, domain.ViolationTemporal: conformancev1.ViolationType_VIOLATION_TYPE_TEMPORAL_DEVIATION, domain.ViolationTelemetryLoss: conformancev1.ViolationType_VIOLATION_TYPE_TELEMETRY_LOSS}
-var phaseToProto = map[domain.IncidentPhase]conformancev1.IncidentPhase{domain.IncidentClear: conformancev1.IncidentPhase_INCIDENT_PHASE_CLEAR, domain.IncidentSuspected: conformancev1.IncidentPhase_INCIDENT_PHASE_SUSPECTED, domain.IncidentOpen: conformancev1.IncidentPhase_INCIDENT_PHASE_OPEN, domain.IncidentRecovering: conformancev1.IncidentPhase_INCIDENT_PHASE_RECOVERING}
+var (
+	conditionToProto  = map[domain.Condition]conformancev1.ConformanceCondition{domain.ConditionUnknown: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_UNKNOWN, domain.ConditionConforming: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_CONFORMING, domain.ConditionSuspected: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_SUSPECTED, domain.ConditionNonConforming: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_NON_CONFORMING, domain.ConditionRecovering: conformancev1.ConformanceCondition_CONFORMANCE_CONDITION_RECOVERING}
+	monitoringToProto = map[domain.MonitoringStatus]conformancev1.MonitoringStatus{domain.MonitoringReceived: conformancev1.MonitoringStatus_MONITORING_STATUS_RECEIVED, domain.MonitoringArmed: conformancev1.MonitoringStatus_MONITORING_STATUS_ARMED, domain.MonitoringCurrent: conformancev1.MonitoringStatus_MONITORING_STATUS_CURRENT, domain.MonitoringStale: conformancev1.MonitoringStatus_MONITORING_STATUS_STALE, domain.MonitoringUnavailable: conformancev1.MonitoringStatus_MONITORING_STATUS_UNAVAILABLE}
+	recordingToProto  = map[domain.RecordingStatus]conformancev1.RecordingStatus{domain.RecordingPending: conformancev1.RecordingStatus_RECORDING_STATUS_PENDING, domain.RecordingConfirmed: conformancev1.RecordingStatus_RECORDING_STATUS_CONFIRMED, domain.RecordingDegraded: conformancev1.RecordingStatus_RECORDING_STATUS_DEGRADED}
+	violationToProto  = map[domain.ViolationType]conformancev1.ViolationType{domain.ViolationLateral: conformancev1.ViolationType_VIOLATION_TYPE_LATERAL_DEVIATION, domain.ViolationVertical: conformancev1.ViolationType_VIOLATION_TYPE_ALTITUDE_DEVIATION, domain.ViolationTemporal: conformancev1.ViolationType_VIOLATION_TYPE_TEMPORAL_DEVIATION, domain.ViolationTelemetryLoss: conformancev1.ViolationType_VIOLATION_TYPE_TELEMETRY_LOSS}
+	phaseToProto      = map[domain.IncidentPhase]conformancev1.IncidentPhase{domain.IncidentClear: conformancev1.IncidentPhase_INCIDENT_PHASE_CLEAR, domain.IncidentSuspected: conformancev1.IncidentPhase_INCIDENT_PHASE_SUSPECTED, domain.IncidentOpen: conformancev1.IncidentPhase_INCIDENT_PHASE_OPEN, domain.IncidentRecovering: conformancev1.IncidentPhase_INCIDENT_PHASE_RECOVERING}
+)
