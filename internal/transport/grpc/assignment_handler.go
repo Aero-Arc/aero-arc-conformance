@@ -201,7 +201,7 @@ func assignmentFromProto(value *conformancev1.Assignment, policyVersion string) 
 		}
 		assignment.Volumes = append(assignment.Volumes, volume)
 	}
-	if strings.TrimSpace(assignment.ID) == "" || !validAssignmentGeneration(assignment.Generation) || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || assignment.PolicyVersion != policyVersion || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) || len(assignment.Volumes) == 0 {
+	if strings.TrimSpace(assignment.ID) == "" || !validAssignmentGeneration(assignment.Generation) || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || assignment.IntentVersion > math.MaxInt32 || assignment.PolicyVersion != policyVersion || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) || len(assignment.Volumes) == 0 {
 		return domain.Assignment{}, fmt.Errorf("assignment identity and effective window are invalid")
 	}
 	return assignment, nil

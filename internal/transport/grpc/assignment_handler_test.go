@@ -154,6 +154,7 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	overflowGeneration := uint64(math.MaxInt64) + 1
+	overflowIntentVersion := uint32(math.MaxInt32) + 1
 	overflowTime := time.Date(2262, time.January, 1, 0, 0, 0, 0, time.UTC)
 	validAssignment := func(generation uint64, effectiveFrom, effectiveUntil time.Time) *conformancev1.Assignment {
 		assignment := validAssignmentProto(effectiveFrom, generation)
@@ -173,6 +174,12 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 		},
 		"prepare timestamp": func() error {
 			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-time", Assignment: validAssignment(1, overflowTime, overflowTime.Add(time.Hour))})
+			return err
+		},
+		"prepare intent version": func() error {
+			assignment := validAssignment(1, now, now.Add(time.Hour))
+			assignment.IntentVersion = overflowIntentVersion
+			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-intent-version", Assignment: assignment})
 			return err
 		},
 		"prepare NaN altitude": func() error {
