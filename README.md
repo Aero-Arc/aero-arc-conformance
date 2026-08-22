@@ -72,6 +72,7 @@ signed by the configured client CA. Management endpoints default to:
 ## Read next
 
 - [Conformance design](docs/conformance-design.md)
+- [Scaling, retention, and flight finalization](docs/scaling-retention.md)
 - [Blue-green assignment cutover](docs/assignment-cutover.md)
 - [Development and validation](docs/development.md)
 - [Configuration](docs/configuration.md)

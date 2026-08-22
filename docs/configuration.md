@@ -21,6 +21,16 @@ Important timing relationships:
 - Registry publication and retry intervals control delivery cadence without
   coupling evaluation commits to Registry availability.
 
+The example's one-second Influx poll and Registry publication intervals are
+prototype polling defaults, not supported fleet-throughput targets. Today every
+live evaluation commit produces a checkpoint and Registry outbox row, and the
+example publisher claims at most 20 rows per flush. The planned production
+controls separate evaluation, recovery checkpoint, projection-change,
+heartbeat, final-reconciliation, archival, and retention cadences; they must not
+be added to configuration before their behavior and safety relationships are
+implemented and tested. See
+[Scaling, Retention, and Flight Finalization](scaling-retention.md).
+
 `service.grpc_address` exposes assignment lifecycle RPCs and always requires
 mutual TLS. `service.grpc_tls.certificate_file` and `private_key_file` identify
 the Conformance server identity. `client_ca_file` must contain the CA used to
