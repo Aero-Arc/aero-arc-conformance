@@ -294,6 +294,16 @@ func (w *Worker) readComplete(ctx context.Context, aircraftID string, start, end
 	}
 	left.Observations = append(left.Observations, right.Observations...)
 	left.Rejections = append(left.Rejections, right.Rejections...)
+	seenFrames := make(map[string]struct{}, len(left.Observations))
+	deduplicated := left.Observations[:0]
+	for _, observation := range left.Observations {
+		if _, seen := seenFrames[observation.FrameID]; seen {
+			continue
+		}
+		seenFrames[observation.FrameID] = struct{}{}
+		deduplicated = append(deduplicated, observation)
+	}
+	left.Observations = deduplicated
 	return left, nil
 }
 

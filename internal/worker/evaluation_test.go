@@ -74,7 +74,9 @@ func TestWorkerEmptyWindowDefersWithoutAdvancingRevision(t *testing.T) {
 func TestWorkerSplitsSaturatedWindowBeforeCommit(t *testing.T) {
 	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
 	store := &fakeStore{}
-	reader := &fakeReader{saturateOnce: true, result: telemetryinflux.ReadResult{Observations: []domain.Observation{testObservation(now.Add(-3*time.Second), "frame-1", 1)}}}
+	observation := testObservation(now.Add(-3*time.Second), "frame-1", 1)
+	observation.Latitude = 36
+	reader := &fakeReader{saturateOnce: true, result: telemetryinflux.ReadResult{Observations: []domain.Observation{observation}}}
 	w := newTestWorker(t, store, reader, testEvaluator(t), now)
 	if err := w.processClaim(context.Background(), testClaim(now)); err != nil {
 		t.Fatal(err)
@@ -84,6 +86,10 @@ func TestWorkerSplitsSaturatedWindowBeforeCommit(t *testing.T) {
 	}
 	if len(store.commits) != 1 {
 		t.Fatalf("commits=%d", len(store.commits))
+	}
+	state := store.commits[0].Evaluation.State.Violations[domain.ViolationLateral]
+	if state.ConsecutiveOutside != 1 || state.Phase != domain.IncidentSuspected || len(store.commits[0].Evaluation.Transitions) != 0 {
+		t.Fatalf("split-window duplicate advanced hysteresis: state=%#v transitions=%#v", state, store.commits[0].Evaluation.Transitions)
 	}
 }
 
