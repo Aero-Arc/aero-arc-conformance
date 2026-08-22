@@ -234,6 +234,44 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 		t.Fatalf("release final-tail claim: %v", err)
 	}
 
+	precisionStart := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Microsecond).Add(123 * time.Nanosecond)
+	precisionEnd := precisionStart.Add(time.Hour).Add(211 * time.Nanosecond)
+	precisionAssignment := workerAssignment
+	precisionAssignment.ID = "assignment-nanosecond-cursors"
+	precisionAssignment.EffectiveFrom = precisionStart
+	precisionAssignment.EffectiveUntil = precisionEnd
+	precisionAssignment.Volumes = append([]domain.Volume(nil), workerAssignment.Volumes...)
+	precisionAssignment.Volumes[0].StartsAt = precisionStart
+	precisionAssignment.Volumes[0].EndsAt = precisionEnd
+	activateAssignment(t, ctx, store, precisionAssignment, "nanosecond-cursors", precisionStart)
+	precisionClaims, err := store.ClaimDueAssignments(ctx, "nanosecond-worker", 5*time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var precisionClaim postgresstore.Claim
+	for _, claim := range precisionClaims {
+		if claim.Assignment.ID == precisionAssignment.ID {
+			precisionClaim = claim
+		}
+	}
+	if precisionClaim.Assignment.ID == "" {
+		t.Fatalf("nanosecond assignment was not claimed: %#v", precisionClaims)
+	}
+	if !precisionClaim.AuthorityFrom.Equal(precisionStart) || !precisionClaim.AuthorityUntil.Equal(precisionEnd) {
+		t.Fatalf("claim lost exact authority bounds: got [%s,%s), want [%s,%s)", precisionClaim.AuthorityFrom, precisionClaim.AuthorityUntil, precisionStart, precisionEnd)
+	}
+	precisionObservedAt := precisionStart.Add(time.Second).Add(317 * time.Nanosecond)
+	if err = store.CommitEvaluation(ctx, precisionClaim, postgresstore.EvaluationCommit{Evaluation: sampleEvaluation(precisionObservedAt), NextEvaluationAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("commit nanosecond checkpoint: %v", err)
+	}
+	if _, found, err = store.GetReplayCheckpoint(ctx, precisionAssignment.ID, precisionAssignment.Generation, precisionObservedAt.Add(-time.Nanosecond)); err != nil || found {
+		t.Fatalf("checkpoint crossed exact nanosecond boundary: found=%v err=%v", found, err)
+	}
+	precisionCheckpoint, found, err := store.GetReplayCheckpoint(ctx, precisionAssignment.ID, precisionAssignment.Generation, precisionObservedAt)
+	if err != nil || !found || !precisionCheckpoint.StateThroughAt.Equal(precisionObservedAt) {
+		t.Fatalf("checkpoint lost exact nanosecond cursor: checkpoint=%#v found=%v err=%v", precisionCheckpoint, found, err)
+	}
+
 	t.Run("blue-green assignment cutover", func(t *testing.T) {
 		testBlueGreenCutover(t, ctx, store, pg.URL, now)
 	})

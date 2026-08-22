@@ -691,8 +691,8 @@ ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
 FROM due WHERE a.assignment_id=due.assignment_id AND a.assignment_generation=due.assignment_generation
-RETURNING a.specification,a.authority_from,a.authority_until,a.lease_generation,a.lease_until,a.evaluation_revision)
-SELECT specification,authority_from,authority_until,lease_generation,lease_until,evaluation_revision FROM claimed`, limit, workerID, lease.String(), finalizationGrace.String())
+RETURNING a.specification,a.authority_from_unix_ns,a.authority_until_unix_ns,a.lease_generation,a.lease_until,a.evaluation_revision)
+SELECT specification,authority_from_unix_ns,authority_until_unix_ns,lease_generation,lease_until,evaluation_revision FROM claimed`, limit, workerID, lease.String(), finalizationGrace.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim assignments: %w", err)
 	}
@@ -700,12 +700,15 @@ SELECT specification,authority_from,authority_until,lease_generation,lease_until
 	claims := make([]Claim, 0, limit)
 	for rows.Next() {
 		var raw []byte
+		var authorityFromUnixNS, authorityUntilUnixNS int64
 		var c Claim
 		c.WorkerID = workerID
 		c.FinalizationGrace = finalizationGrace
-		if err = rows.Scan(&raw, &c.AuthorityFrom, &c.AuthorityUntil, &c.LeaseGeneration, &c.LeaseUntil, &c.EvaluationRevision); err != nil {
+		if err = rows.Scan(&raw, &authorityFromUnixNS, &authorityUntilUnixNS, &c.LeaseGeneration, &c.LeaseUntil, &c.EvaluationRevision); err != nil {
 			return nil, err
 		}
+		c.AuthorityFrom = time.Unix(0, authorityFromUnixNS).UTC()
+		c.AuthorityUntil = time.Unix(0, authorityUntilUnixNS).UTC()
 		if err = json.Unmarshal(raw, &c.Assignment); err != nil {
 			return nil, fmt.Errorf("decode assignment: %w", err)
 		}
@@ -796,14 +799,16 @@ type ReplayCheckpoint struct {
 //   - error: reports database or evaluator-state decoding failure.
 func (s *Store) GetReplayCheckpoint(ctx context.Context, assignmentID string, generation uint64, atOrBefore time.Time) (ReplayCheckpoint, bool, error) {
 	var checkpoint ReplayCheckpoint
+	var stateThroughUnixNS int64
 	var state []byte
-	err := s.pool.QueryRow(ctx, `SELECT evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2 AND state_through_at<=$3 ORDER BY state_through_at DESC,wal_id DESC,wal_sequence DESC,frame_id DESC LIMIT 1`, assignmentID, generation, atOrBefore).Scan(&checkpoint.EvaluationRevision, &checkpoint.StateThroughAt, &checkpoint.WALID, &checkpoint.WALSequence, &checkpoint.FrameID, &state)
+	err := s.pool.QueryRow(ctx, `SELECT evaluation_revision,state_through_at_unix_ns,wal_id,wal_sequence,frame_id,evaluator_state FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2 AND state_through_at_unix_ns<=$3 ORDER BY state_through_at_unix_ns DESC,wal_id DESC,wal_sequence DESC,frame_id DESC LIMIT 1`, assignmentID, generation, atOrBefore.UnixNano()).Scan(&checkpoint.EvaluationRevision, &stateThroughUnixNS, &checkpoint.WALID, &checkpoint.WALSequence, &checkpoint.FrameID, &state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ReplayCheckpoint{}, false, nil
 	}
 	if err != nil {
 		return ReplayCheckpoint{}, false, fmt.Errorf("read replay checkpoint: %w", err)
 	}
+	checkpoint.StateThroughAt = time.Unix(0, stateThroughUnixNS).UTC()
 	if err = json.Unmarshal(state, &checkpoint.State); err != nil {
 		return ReplayCheckpoint{}, false, fmt.Errorf("decode replay checkpoint: %w", err)
 	}
@@ -1070,7 +1075,7 @@ RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, 
 			}
 		}
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, assignment.ID, assignment.Generation, revision, evaluation.ObservedAt, evaluation.WALID, evaluation.WALSequence, evaluation.FrameID, state); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,state_through_at_unix_ns,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, assignment.ID, assignment.Generation, revision, evaluation.ObservedAt, evaluation.ObservedAt.UnixNano(), evaluation.WALID, evaluation.WALSequence, evaluation.FrameID, state); err != nil {
 		return fmt.Errorf("insert checkpoint: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,observed_at_unix_ns,frame_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_id,assignment_generation) DO UPDATE SET evaluation_revision=EXCLUDED.evaluation_revision,condition=EXCLUDED.condition,monitoring_status=EXCLUDED.monitoring_status,recording_status=EXCLUDED.recording_status,observed_at=EXCLUDED.observed_at,observed_at_unix_ns=EXCLUDED.observed_at_unix_ns,frame_id=EXCLUDED.frame_id,payload=EXCLUDED.payload,updated_at=now()`, assignment.ID, assignment.Generation, revision, evaluation.Condition, evaluation.Monitoring, domain.RecordingConfirmed, evaluation.ObservedAt, evaluation.ObservedAt.UnixNano(), evaluation.FrameID, payload); err != nil {
