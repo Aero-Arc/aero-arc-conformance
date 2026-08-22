@@ -33,7 +33,8 @@ type AssignmentStore interface {
 // store.
 type AssignmentHandler struct {
 	conformancev1.UnimplementedConformanceServiceServer
-	store AssignmentStore
+	store         AssignmentStore
+	policyVersion string
 }
 
 var _ conformancev1.ConformanceServiceServer = (*AssignmentHandler)(nil)
@@ -42,16 +43,17 @@ var _ conformancev1.ConformanceServiceServer = (*AssignmentHandler)(nil)
 //
 // Parameters:
 //   - store: persists idempotent lifecycle commands and authority cutovers.
+//   - policyVersion: identifies the evaluator policy this process can execute.
 //
 // Returns:
 //   - handler: implements the generated Conformance service contract without
 //     owning the gRPC server or its lifecycle.
-//   - error: reports a missing durable store.
-func NewAssignmentHandler(store AssignmentStore) (*AssignmentHandler, error) {
-	if store == nil {
-		return nil, fmt.Errorf("assignment store is required")
+//   - error: reports a missing durable store or supported policy version.
+func NewAssignmentHandler(store AssignmentStore, policyVersion string) (*AssignmentHandler, error) {
+	if store == nil || strings.TrimSpace(policyVersion) == "" {
+		return nil, fmt.Errorf("assignment store and policy version are required")
 	}
-	return &AssignmentHandler{store: store}, nil
+	return &AssignmentHandler{store: store, policyVersion: policyVersion}, nil
 }
 
 // PrepareAssignment durably stores an immutable candidate without granting
@@ -70,7 +72,7 @@ func (s *AssignmentHandler) PrepareAssignment(ctx context.Context, request *conf
 	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" {
 		return nil, status.Error(codes.InvalidArgument, "source and message_id are required")
 	}
-	assignment, err := assignmentFromProto(request.GetAssignment())
+	assignment, err := assignmentFromProto(request.GetAssignment(), s.policyVersion)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -159,7 +161,7 @@ func (s *AssignmentHandler) GetAssignment(ctx context.Context, request *conforma
 	return &conformancev1.GetAssignmentResponse{Assignment: assignmentRecordToProto(record)}, nil
 }
 
-func assignmentFromProto(value *conformancev1.Assignment) (domain.Assignment, error) {
+func assignmentFromProto(value *conformancev1.Assignment, policyVersion string) (domain.Assignment, error) {
 	if value == nil || value.GetEffectiveFrom() == nil || value.GetEffectiveUntil() == nil {
 		return domain.Assignment{}, fmt.Errorf("assignment and effective window are required")
 	}
@@ -183,23 +185,30 @@ func assignmentFromProto(value *conformancev1.Assignment) (domain.Assignment, er
 		if math.IsNaN(input.GetAltitudeLowerM()) || math.IsInf(input.GetAltitudeLowerM(), 0) || math.IsNaN(input.GetAltitudeUpperM()) || math.IsInf(input.GetAltitudeUpperM(), 0) {
 			return domain.Assignment{}, fmt.Errorf("volume altitude bounds must be finite")
 		}
+		if strings.TrimSpace(input.GetVolumeId()) == "" || len(input.GetPolygon()) < 3 || !input.GetEndsAt().AsTime().After(input.GetStartsAt().AsTime()) || input.GetAltitudeLowerM() > input.GetAltitudeUpperM() {
+			return domain.Assignment{}, fmt.Errorf("volume identity, polygon, time window, and altitude bounds are invalid")
+		}
 		reference, ok := altitudeReferenceFromProto[input.GetAltitudeReference()]
 		if !ok {
 			return domain.Assignment{}, fmt.Errorf("volume altitude reference is invalid")
 		}
 		volume := domain.Volume{ID: input.GetVolumeId(), AltitudeLowerM: input.GetAltitudeLowerM(), AltitudeUpperM: input.GetAltitudeUpperM(), AltitudeReference: reference, StartsAt: input.GetStartsAt().AsTime(), EndsAt: input.GetEndsAt().AsTime(), Polygon: make([]domain.Point, 0, len(input.GetPolygon()))}
 		for _, point := range input.GetPolygon() {
-			if point == nil || math.IsNaN(point.GetLatitude()) || math.IsInf(point.GetLatitude(), 0) || math.IsNaN(point.GetLongitude()) || math.IsInf(point.GetLongitude(), 0) {
+			if point == nil || !validGeographicCoordinate(point.GetLatitude(), point.GetLongitude()) {
 				return domain.Assignment{}, fmt.Errorf("volume polygon contains an invalid point")
 			}
 			volume.Polygon = append(volume.Polygon, domain.Point{Latitude: point.GetLatitude(), Longitude: point.GetLongitude()})
 		}
 		assignment.Volumes = append(assignment.Volumes, volume)
 	}
-	if strings.TrimSpace(assignment.ID) == "" || !validAssignmentGeneration(assignment.Generation) || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) {
+	if strings.TrimSpace(assignment.ID) == "" || !validAssignmentGeneration(assignment.Generation) || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || assignment.PolicyVersion != policyVersion || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) || len(assignment.Volumes) == 0 {
 		return domain.Assignment{}, fmt.Errorf("assignment identity and effective window are invalid")
 	}
 	return assignment, nil
+}
+
+func validGeographicCoordinate(latitude, longitude float64) bool {
+	return !math.IsNaN(latitude) && !math.IsInf(latitude, 0) && latitude >= -90 && latitude <= 90 && !math.IsNaN(longitude) && !math.IsInf(longitude, 0) && longitude >= -180 && longitude <= 180
 }
 
 func validAssignmentGeneration(generation uint64) bool {

@@ -58,7 +58,7 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assignmentHandler, err := assignmentgrpc.NewAssignmentHandler(store)
+	assignmentHandler, err := assignmentgrpc.NewAssignmentHandler(store, "standard-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +85,12 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 		OperatorId: "operator-1", AircraftId: "aircraft-1", AgentId: "agent-1",
 		FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 1, PolicyVersion: "standard-v1",
 		EffectiveFrom: timestamppb.New(now.Add(-time.Hour)), EffectiveUntil: timestamppb.New(now.Add(time.Hour)),
+		Volumes: []*conformancev1.ConformanceVolume{{
+			VolumeId: "volume-1", AltitudeLowerM: 80, AltitudeUpperM: 120,
+			AltitudeReference: conformancev1.AltitudeReference_ALTITUDE_REFERENCE_MSL,
+			StartsAt:          timestamppb.New(now.Add(-time.Hour)), EndsAt: timestamppb.New(now.Add(time.Hour)),
+			Polygon: []*conformancev1.GeographicPoint{{Latitude: 35, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97}},
+		}},
 	}
 	prepared, err := assignmentClient.PrepareAssignment(ctx, &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-1", Assignment: assignment})
 	if err != nil || prepared.GetAssignment().GetLifecycle() != conformancev1.AssignmentLifecycle_ASSIGNMENT_LIFECYCLE_CANDIDATE_RECEIVED {
@@ -121,7 +127,31 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 		State:      domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{}},
 		CausalFrom: observedAt, ObservedAt: observedAt, FrameID: "frame-1", WALID: "wal-1", WALSequence: 1,
 	}
-	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: now.Add(time.Minute)}); err != nil {
+	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: evaluation, NextEvaluationAt: now.Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err = store.ClaimDueAssignments(ctx, "evaluation-worker-2", time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("second ClaimDueAssignments() = %+v, error = %v", claims, err)
+	}
+	secondEvaluation := evaluation
+	secondEvaluation.CausalFrom = observedAt.Add(time.Nanosecond)
+	secondEvaluation.ObservedAt = observedAt.Add(time.Nanosecond)
+	secondEvaluation.FrameID = "frame-2"
+	secondEvaluation.WALSequence = 2
+	if err = store.CommitEvaluation(ctx, claims[0], postgresstore.EvaluationCommit{Evaluation: secondEvaluation, NextEvaluationAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstPublisherClaims, err := store.ClaimOutbox(ctx, "registry", "ordering-probe-1", time.Minute, 10)
+	if err != nil || len(firstPublisherClaims) != 1 || firstPublisherClaims[0].EvaluationRevision != 1 {
+		t.Fatalf("first Registry claim = %+v, error = %v", firstPublisherClaims, err)
+	}
+	secondPublisherClaims, err := store.ClaimOutbox(ctx, "registry", "ordering-probe-2", time.Minute, 10)
+	if err != nil || len(secondPublisherClaims) != 0 {
+		t.Fatalf("concurrent Registry claim bypassed the assignment head: %+v, error = %v", secondPublisherClaims, err)
+	}
+	if err = store.RetryOutbox(ctx, firstPublisherClaims[0], time.Millisecond, errors.New("release ordering probe")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -164,14 +194,21 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 	defer pool.Close()
 	var delivered bool
 	var attemptCount int
-	if err = pool.QueryRow(ctx, `SELECT delivered_at IS NOT NULL,attempt_count FROM conformance_outbox WHERE destination='registry' AND assignment_id=$1`, assignment.GetAssignmentId()).Scan(&delivered, &attemptCount); err != nil {
+	if err = pool.QueryRow(ctx, `SELECT delivered_at IS NOT NULL,attempt_count FROM conformance_outbox WHERE destination='registry' AND assignment_id=$1 AND evaluation_revision=1`, assignment.GetAssignmentId()).Scan(&delivered, &attemptCount); err != nil {
 		t.Fatal(err)
 	}
-	if !delivered || attemptCount != 1 {
+	if !delivered || attemptCount != 2 {
 		t.Fatalf("outbox delivered=%v attempt_count=%d", delivered, attemptCount)
 	}
-	if processed, err = publisher.Flush(ctx); err != nil || processed != 0 {
+	if processed, err = publisher.Flush(ctx); err != nil || processed != 1 {
 		t.Fatalf("second Flush() processed=%d error=%v", processed, err)
+	}
+	published = registryService.summary()
+	if published.GetEvaluationRevision() != 2 || published.GetFrameId() != "frame-2" {
+		t.Fatalf("second published summary = %+v", published)
+	}
+	if processed, err = publisher.Flush(ctx); err != nil || processed != 0 {
+		t.Fatalf("third Flush() processed=%d error=%v", processed, err)
 	}
 }
 

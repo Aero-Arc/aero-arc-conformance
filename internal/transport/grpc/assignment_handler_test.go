@@ -15,6 +15,7 @@ import (
 	conformancev1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -57,18 +58,14 @@ func (s *assignmentStoreStub) GetAssignment(context.Context, string, uint64) (do
 
 func TestPrepareAssignmentReturnsStaleWithoutStoredRecord(t *testing.T) {
 	store := &assignmentStoreStub{prepareDisposition: postgresstore.ApplyStale, getErr: postgresstore.ErrAssignmentNotFound}
-	handler, err := NewAssignmentHandler(store)
+	handler, err := NewAssignmentHandler(store, "standard-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
 	response, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{
 		Source: "api", MessageId: "stale-message",
-		Assignment: &conformancev1.Assignment{
-			AssignmentId: "assignment-1", AssignmentGeneration: 6, AircraftId: "aircraft-1", AgentId: "agent-1",
-			FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2, PolicyVersion: "standard-v1",
-			EffectiveFrom: timestamppb.New(now), EffectiveUntil: timestamppb.New(now.Add(time.Hour)),
-		},
+		Assignment: validAssignmentProto(now, 6),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +77,7 @@ func TestPrepareAssignmentReturnsStaleWithoutStoredRecord(t *testing.T) {
 
 func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {
 	store := &assignmentStoreStub{}
-	handler, err := NewAssignmentHandler(store)
+	handler, err := NewAssignmentHandler(store, "standard-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,8 +99,56 @@ func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {
 	}
 }
 
+func TestPrepareAssignmentRejectsEvaluatorInvalidAssignments(t *testing.T) {
+	now := time.Now().UTC()
+	tests := map[string]func(*conformancev1.Assignment){
+		"missing volumes": func(assignment *conformancev1.Assignment) { assignment.Volumes = nil },
+		"missing volume":  func(assignment *conformancev1.Assignment) { assignment.Volumes[0] = nil },
+		"blank volume ID": func(assignment *conformancev1.Assignment) { assignment.Volumes[0].VolumeId = " " },
+		"short polygon": func(assignment *conformancev1.Assignment) {
+			assignment.Volumes[0].Polygon = assignment.Volumes[0].Polygon[:2]
+		},
+		"reversed volume time": func(assignment *conformancev1.Assignment) {
+			assignment.Volumes[0].EndsAt = assignment.Volumes[0].StartsAt
+		},
+		"reversed altitude bounds": func(assignment *conformancev1.Assignment) { assignment.Volumes[0].AltitudeLowerM = 121 },
+		"invalid latitude":         func(assignment *conformancev1.Assignment) { assignment.Volumes[0].Polygon[0].Latitude = 91 },
+		"invalid longitude":        func(assignment *conformancev1.Assignment) { assignment.Volumes[0].Polygon[0].Longitude = -181 },
+		"unsupported policy":       func(assignment *conformancev1.Assignment) { assignment.PolicyVersion = "future-v2" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := &assignmentStoreStub{}
+			handler, err := NewAssignmentHandler(store, "standard-v1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assignment := proto.Clone(validAssignmentProto(now, 1)).(*conformancev1.Assignment)
+			mutate(assignment)
+			_, err = handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "invalid-assignment", Assignment: assignment})
+			if status.Code(err) != codes.InvalidArgument || store.prepared.ID != "" {
+				t.Fatalf("error=%v prepared=%+v", err, store.prepared)
+			}
+		})
+	}
+}
+
+func validAssignmentProto(now time.Time, generation uint64) *conformancev1.Assignment {
+	return &conformancev1.Assignment{
+		AssignmentId: "assignment-1", AssignmentGeneration: generation, AircraftId: "aircraft-1", AgentId: "agent-1",
+		FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2, PolicyVersion: "standard-v1",
+		EffectiveFrom: timestamppb.New(now), EffectiveUntil: timestamppb.New(now.Add(time.Hour)),
+		Volumes: []*conformancev1.ConformanceVolume{{
+			VolumeId: "volume-1", AltitudeLowerM: 80, AltitudeUpperM: 120,
+			AltitudeReference: conformancev1.AltitudeReference_ALTITUDE_REFERENCE_MSL,
+			StartsAt:          timestamppb.New(now), EndsAt: timestamppb.New(now.Add(time.Hour)),
+			Polygon: []*conformancev1.GeographicPoint{{Latitude: 1, Longitude: 2}, {Latitude: 1, Longitude: 3}, {Latitude: 2, Longitude: 3}},
+		}},
+	}
+}
+
 func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
-	handler, err := NewAssignmentHandler(&assignmentStoreStub{})
+	handler, err := NewAssignmentHandler(&assignmentStoreStub{}, "standard-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,19 +156,14 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 	overflowGeneration := uint64(math.MaxInt64) + 1
 	overflowTime := time.Date(2262, time.January, 1, 0, 0, 0, 0, time.UTC)
 	validAssignment := func(generation uint64, effectiveFrom, effectiveUntil time.Time) *conformancev1.Assignment {
-		return &conformancev1.Assignment{
-			AssignmentId: "assignment-1", AssignmentGeneration: generation, AircraftId: "aircraft-1", AgentId: "agent-1",
-			FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2, PolicyVersion: "standard-v1",
-			EffectiveFrom: timestamppb.New(effectiveFrom), EffectiveUntil: timestamppb.New(effectiveUntil),
-		}
+		assignment := validAssignmentProto(effectiveFrom, generation)
+		assignment.EffectiveUntil = timestamppb.New(effectiveUntil)
+		return assignment
 	}
 	assignmentWithAltitude := func(lower, upper float64) *conformancev1.Assignment {
 		assignment := validAssignment(1, now, now.Add(time.Hour))
-		assignment.Volumes = []*conformancev1.ConformanceVolume{{
-			VolumeId: "volume-1", AltitudeLowerM: lower, AltitudeUpperM: upper,
-			AltitudeReference: conformancev1.AltitudeReference_ALTITUDE_REFERENCE_MSL,
-			StartsAt:          timestamppb.New(now), EndsAt: timestamppb.New(now.Add(time.Hour)),
-		}}
+		assignment.Volumes[0].AltitudeLowerM = lower
+		assignment.Volumes[0].AltitudeUpperM = upper
 		return assignment
 	}
 	tests := map[string]func() error{
@@ -170,7 +210,7 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 }
 
 func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
-	handler, err := NewAssignmentHandler(&assignmentStoreStub{err: postgresstore.ErrStaleAssignment})
+	handler, err := NewAssignmentHandler(&assignmentStoreStub{err: postgresstore.ErrStaleAssignment}, "standard-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +220,7 @@ func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
 	if _, err := handler.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("stale assignment error = %v", err)
 	}
-	missing, err := NewAssignmentHandler(&assignmentStoreStub{err: postgresstore.ErrAssignmentNotFound})
+	missing, err := NewAssignmentHandler(&assignmentStoreStub{err: postgresstore.ErrAssignmentNotFound}, "standard-v1")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -98,8 +98,9 @@ func (p *Publisher) Run(ctx context.Context) error {
 	}
 }
 
-// Flush claims and attempts one bounded batch, continuing past individual
-// poison or unavailable messages so one assignment cannot block its neighbors.
+// Flush claims and attempts one bounded batch. The store returns at most the
+// oldest undelivered Registry cursor per assignment, allowing independent
+// assignments to publish concurrently without reordering any one assignment.
 //
 // Parameters:
 //   - ctx: controls the claim and every delivery attempt.

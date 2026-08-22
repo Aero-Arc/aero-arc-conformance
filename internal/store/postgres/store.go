@@ -1051,7 +1051,9 @@ type OutboxClaim struct {
 }
 
 // ClaimOutbox atomically leases due messages for one destination using
-// PostgreSQL time and increments each delivery lease generation.
+// PostgreSQL time and increments each delivery lease generation. Registry
+// claims expose only the oldest undelivered cursor for each assignment, so
+// publication remains ordered across batches and publisher replicas.
 //
 // Parameters:
 //   - ctx: controls the claim transaction.
@@ -1068,9 +1070,14 @@ func (s *Store) ClaimOutbox(ctx context.Context, destination, workerID string, l
 		return nil, fmt.Errorf("outbox claim arguments are invalid")
 	}
 	rows, err := s.pool.Query(ctx, `WITH due AS (
-SELECT outbox_id FROM conformance_outbox
-WHERE destination=$1 AND delivered_at IS NULL AND next_attempt_at<=now() AND (lease_until IS NULL OR lease_until<now())
-ORDER BY next_attempt_at,outbox_id FOR UPDATE SKIP LOCKED LIMIT $2
+SELECT candidate.outbox_id FROM conformance_outbox candidate
+WHERE candidate.destination=$1 AND candidate.delivered_at IS NULL AND candidate.next_attempt_at<=now() AND (candidate.lease_until IS NULL OR candidate.lease_until<now())
+AND (candidate.destination<>'registry' OR NOT EXISTS (
+  SELECT 1 FROM conformance_outbox earlier
+  WHERE earlier.destination=candidate.destination AND earlier.assignment_id=candidate.assignment_id AND earlier.delivered_at IS NULL
+  AND (earlier.assignment_generation,earlier.evaluation_revision)<(candidate.assignment_generation,candidate.evaluation_revision)
+))
+ORDER BY candidate.next_attempt_at,candidate.outbox_id FOR UPDATE OF candidate SKIP LOCKED LIMIT $2
 ), claimed AS (
 UPDATE conformance_outbox o SET lease_owner=$3,lease_generation=o.lease_generation+1,lease_until=now()+$4::interval,attempt_count=o.attempt_count+1,updated_at=now()
 FROM due WHERE o.outbox_id=due.outbox_id

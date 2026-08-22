@@ -82,7 +82,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance
 		store.Close()
 		return nil, err
 	}
-	assignmentHandler, err := conformancegrpc.NewAssignmentHandler(store)
+	assignmentHandler, err := conformancegrpc.NewAssignmentHandler(store, cfg.Policy.Version)
 	if err != nil {
 		_ = reader.Close()
 		store.Close()

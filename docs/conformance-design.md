@@ -198,6 +198,9 @@ long-lived assignment fence survives the short snapshot TTL. Publish operations
 compare assignment generation and evaluation revision; persistence confirmation
 matches the exact evaluation ID. Lower generations/revisions are stale, exact
 retries are idempotent, and conflicting same-cursor content is rejected.
+The outbox leases only the oldest undelivered cursor for each assignment; that
+head-of-line fence preserves cursor order across publisher batches and replicas
+while unrelated assignments continue independently.
 
 Conformance publishes meaningful state transitions, severity changes, recording
 changes, and periodic freshness—not every telemetry frame.
