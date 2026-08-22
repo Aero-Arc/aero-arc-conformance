@@ -29,6 +29,12 @@ workload certificate cannot authorize assignment lifecycle changes. The
 request `source` remains an idempotency namespace and is not an authentication
 credential. Certificate changes take effect after a service restart.
 
+`policy.version` is also an assignment-ingress compatibility fence. Conformance
+rejects a prepared assignment whose policy version differs from the policy
+loaded by the running process, rather than accepting work its evaluator cannot
+execute. Configuration is loaded at startup, so changing the accepted policy
+version requires a controlled service restart.
+
 `registry.address` selects the Registry gRPC target; `registry.insecure` is
 intended only for trusted development networks. Production deployments should
 also use authenticated Registry transport and network policy appropriate to

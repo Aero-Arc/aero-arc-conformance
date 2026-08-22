@@ -121,6 +121,15 @@ reconciliation after ambiguous delivery. The worker that validates and arms a
 candidate remains a later runtime slice and is intentionally not exposed as an
 API-owned command.
 
+`PrepareAssignment` validates the evaluator's executable contract before any
+candidate is persisted. It requires a supported policy, storage-compatible
+generation, intent-version and timestamp ranges, a non-empty effective window,
+and at least one volume. Every volume requires an ID, ordered time and finite
+altitude bounds, a recognized altitude reference, and a polygon with at least
+three finite latitude/longitude points inside geographic ranges. Invalid input
+is returned as `InvalidArgument`; it cannot become a candidate that fails only
+after cutover.
+
 The current store supports exact suffix replay and a shifted resolution for a
 stable incident occurrence. A future arbitrary-suffix reconciliation contract
 must also identify the replaced replay range and materialize which immutable

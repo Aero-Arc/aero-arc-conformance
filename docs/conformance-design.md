@@ -201,6 +201,12 @@ retries are idempotent, and conflicting same-cursor content is rejected.
 The outbox leases only the oldest undelivered cursor for each assignment; that
 head-of-line fence preserves cursor order across publisher batches and replicas
 while unrelated assignments continue independently.
+Only an acknowledgement containing the exact assignment generation, evaluation
+revision, and evaluation ID completes an outbox row. RPC failures and mismatched
+acknowledgements remain retryable: the current Registry contract cannot prove
+whether a `FailedPrecondition` means a higher cursor already won or the same
+cursor conflicts, so Conformance does not discard durable delivery evidence on
+an ambiguous rejection.
 
 Conformance publishes meaningful state transitions, severity changes, recording
 changes, and periodic freshness—not every telemetry frame.
