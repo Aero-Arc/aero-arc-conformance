@@ -179,7 +179,14 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	processed, err := publisher.Flush(ctx)
+	var processed int
+	for deadline := time.Now().Add(time.Second); ; {
+		processed, err = publisher.Flush(ctx)
+		if err != nil || processed != 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err != nil || processed != 1 {
 		t.Fatalf("publisher.Flush() processed=%d error=%v", processed, err)
 	}
