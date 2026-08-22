@@ -6,9 +6,13 @@ toolchain go1.24.9
 
 require (
 	github.com/InfluxCommunity/influxdb3-go/v2 v2.10.0
+	github.com/aero-arc/aero-arc-protos v0.0.0-20260815182056-d2fc8f97f2a8
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/prometheus/client_golang v1.20.5
 	github.com/testcontainers/testcontainers-go v0.40.0
+	github.com/urfave/cli/v3 v3.11.0
+	google.golang.org/grpc v1.77.0
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -89,6 +93,4 @@ require (
 	golang.org/x/tools v0.37.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251022142026-3a174f9686a8 // indirect
-	google.golang.org/grpc v1.77.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 )

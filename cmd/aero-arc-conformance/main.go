@@ -6,22 +6,43 @@ package main
 
 import (
 	"context"
-	"flag"
-	"github.com/aero-arc/aero-arc-conformance/internal/app"
-	"github.com/aero-arc/aero-arc-conformance/internal/config"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/aero-arc/aero-arc-conformance/internal/config"
+	"github.com/aero-arc/aero-arc-conformance/internal/conformance"
+	"github.com/urfave/cli/v3"
 )
 
 func main() {
-	path := flag.String("config-path", "configs/config.yaml", "configuration file")
-	flag.Parse()
-	cfg, err := config.Load(*path)
-	if err != nil {
-		slog.Error("load configuration", "error", err)
+	if err := newCommand().Run(context.Background(), os.Args); err != nil {
+		slog.Error("aero-arc-conformance failed", "error", err)
 		os.Exit(1)
+	}
+}
+
+func newCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "aero-arc-conformance",
+		Usage: "run the Aero Arc Conformance service",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "config-path",
+				Value: "configs/config.yaml",
+				Usage: "path to the configuration file",
+			},
+		},
+		Action: runConformance,
+	}
+}
+
+func runConformance(ctx context.Context, cmd *cli.Command) error {
+	cfg, err := config.Load(cmd.String("config-path"))
+	if err != nil {
+		return fmt.Errorf("load configuration: %w", err)
 	}
 	level := map[string]slog.Level{"debug": slog.LevelDebug, "info": slog.LevelInfo, "warn": slog.LevelWarn, "error": slog.LevelError}[cfg.Logging.Level]
 	var handler slog.Handler
@@ -31,16 +52,15 @@ func main() {
 		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
 	}
 	log := slog.New(handler)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	application, err := app.New(ctx, cfg, log)
+	service, err := conformance.New(ctx, cfg, log)
 	if err != nil {
-		log.Error("initialize conformance", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize conformance: %w", err)
 	}
-	log.Info("conformance started", "management_address", cfg.Service.ManagementAddress, "worker_id", cfg.Worker.ID)
-	if err = application.Run(ctx); err != nil {
-		log.Error("conformance stopped", "error", err)
-		os.Exit(1)
+	log.Info("conformance started", "management_address", cfg.Service.ManagementAddress, "grpc_address", cfg.Service.GRPCAddress, "registry_address", cfg.Registry.Address, "worker_id", cfg.Worker.ID)
+	if err := service.Run(ctx); err != nil {
+		return fmt.Errorf("run conformance: %w", err)
 	}
+	return nil
 }

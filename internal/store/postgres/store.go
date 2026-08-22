@@ -22,11 +22,13 @@ import (
 )
 
 var (
-	ErrLeaseLost         = errors.New("conformance assignment lease lost")
-	ErrMessageConflict   = errors.New("inbox message ID reused with different payload")
-	ErrStaleEvaluation   = errors.New("evaluation is older than the current live watermark")
-	ErrInvalidTransition = errors.New("invalid assignment lifecycle transition")
-	ErrStaleAssignment   = errors.New("assignment generation is stale")
+	ErrLeaseLost          = errors.New("conformance assignment lease lost")
+	ErrMessageConflict    = errors.New("inbox message ID reused with different payload")
+	ErrStaleEvaluation    = errors.New("evaluation is older than the current live watermark")
+	ErrInvalidTransition  = errors.New("invalid assignment lifecycle transition")
+	ErrStaleAssignment    = errors.New("assignment generation is stale")
+	ErrAssignmentNotFound = errors.New("assignment generation not found")
+	ErrOutboxLeaseLost    = errors.New("conformance outbox lease lost")
 )
 
 type Store struct{ pool *pgxpool.Pool }
@@ -102,11 +104,13 @@ type ApplyResult struct {
 //   - assignment: is the immutable candidate generation and specification.
 //
 // Returns:
-//   - result: distinguishes applied, idempotent, and stale delivery outcomes.
+//   - result: distinguishes applied, idempotent, and stale delivery outcomes;
+//     replaying a stale command returns stale again because no assignment row
+//     exists for that rejected generation.
 //   - error: reports invalid identity/specification, conflicting message reuse,
 //     immutable-identity changes, or transaction failure.
 func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messageType string, assignment domain.Assignment) (ApplyResult, error) {
-	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(messageType) == "" || strings.TrimSpace(assignment.ID) == "" || assignment.Generation == 0 || assignment.Generation > math.MaxInt64 || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(messageType) == "" || strings.TrimSpace(assignment.ID) == "" || assignment.Generation == 0 || assignment.Generation > math.MaxInt64 || strings.TrimSpace(assignment.AircraftID) == "" || strings.TrimSpace(assignment.AgentID) == "" || strings.TrimSpace(assignment.FlightID) == "" || strings.TrimSpace(assignment.IntentID) == "" || assignment.IntentVersion == 0 || assignment.IntentVersion > math.MaxInt32 || strings.TrimSpace(assignment.PolicyVersion) == "" || !assignment.EffectiveUntil.After(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveFrom) || !supportedUnixNanoseconds(assignment.EffectiveUntil) {
 		return ApplyResult{}, fmt.Errorf("assignment envelope is invalid")
 	}
 	payload, err := json.Marshal(assignment)
@@ -136,16 +140,24 @@ func (s *Store) PrepareAssignment(ctx context.Context, source, messageID, messag
 		return ApplyResult{}, fmt.Errorf("lock assignment: %w", err)
 	}
 
-	var existingHash string
-	err = tx.QueryRow(ctx, `SELECT payload_sha256 FROM conformance_inbox WHERE source=$1 AND message_id=$2 FOR UPDATE`, source, messageID).Scan(&existingHash)
+	var existingHash, existingDisposition string
+	err = tx.QueryRow(ctx, `SELECT payload_sha256,COALESCE(outcome->>'disposition','') FROM conformance_inbox WHERE source=$1 AND message_id=$2 FOR UPDATE`, source, messageID).Scan(&existingHash, &existingDisposition)
 	if err == nil {
 		if existingHash != hash {
 			return ApplyResult{}, ErrMessageConflict
 		}
+		disposition := ApplyIdempotent
+		switch ApplyDisposition(existingDisposition) {
+		case ApplyStale:
+			disposition = ApplyStale
+		case ApplyApplied, ApplyIdempotent:
+		default:
+			return ApplyResult{}, fmt.Errorf("stored assignment outcome is invalid")
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ApplyResult{}, err
 		}
-		return ApplyResult{Disposition: ApplyIdempotent, Assignment: assignment}, nil
+		return ApplyResult{Disposition: disposition, Assignment: assignment}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return ApplyResult{}, fmt.Errorf("read inbox: %w", err)
@@ -514,6 +526,31 @@ func (s *Store) ResolveAssignmentAt(ctx context.Context, assignmentID string, ob
 		return domain.AssignmentRecord{}, false, fmt.Errorf("resolve assignment at observation: %w", err)
 	}
 	return record, true, nil
+}
+
+// GetAssignment returns one immutable assignment generation and its lifecycle
+// metadata without changing authority or lease state.
+//
+// Parameters:
+//   - ctx: controls the database lookup.
+//   - assignmentID: identifies the logical assignment.
+//   - generation: selects one immutable generation.
+//
+// Returns:
+//   - record: contains lifecycle and half-open authority metadata.
+//   - error: wraps ErrAssignmentNotFound when the exact generation is absent.
+func (s *Store) GetAssignment(ctx context.Context, assignmentID string, generation uint64) (domain.AssignmentRecord, error) {
+	if strings.TrimSpace(assignmentID) == "" || generation == 0 || generation > math.MaxInt64 {
+		return domain.AssignmentRecord{}, fmt.Errorf("assignment lookup is invalid")
+	}
+	record, err := scanAssignmentRecord(s.pool.QueryRow(ctx, `SELECT specification,lifecycle_state,authority_from_unix_ns,authority_until_unix_ns,prepared_at,armed_at,cutover_at FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2`, assignmentID, generation))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AssignmentRecord{}, fmt.Errorf("assignment %s generation %d: %w", assignmentID, generation, ErrAssignmentNotFound)
+	}
+	if err != nil {
+		return domain.AssignmentRecord{}, fmt.Errorf("read assignment generation: %w", err)
+	}
+	return record, nil
 }
 
 func supportedUnixNanoseconds(value time.Time) bool {
@@ -993,6 +1030,129 @@ RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, 
 		if _, err = tx.Exec(ctx, `INSERT INTO conformance_outbox(outbox_id,destination,idempotency_key,assignment_id,assignment_generation,evaluation_revision,payload) VALUES($1,'registry',$1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, outboxID, assignment.ID, assignment.Generation, revision, payload); err != nil {
 			return fmt.Errorf("enqueue live projection: %w", err)
 		}
+	}
+	return nil
+}
+
+// OutboxClaim is one PostgreSQL-clock lease over an undelivered integration
+// message. Lease generation is independent of assignment generation and
+// evaluation revision.
+type OutboxClaim struct {
+	ID                 string
+	Destination        string
+	IdempotencyKey     string
+	Assignment         domain.Assignment
+	EvaluationRevision uint64
+	Evaluation         domain.Evaluation
+	WorkerID           string
+	LeaseGeneration    uint64
+	LeaseUntil         time.Time
+	AttemptCount       uint32
+}
+
+// ClaimOutbox atomically leases due messages for one destination using
+// PostgreSQL time and increments each delivery lease generation. Registry
+// claims expose only the oldest undelivered cursor for each assignment, so
+// publication remains ordered across batches and publisher replicas.
+//
+// Parameters:
+//   - ctx: controls the claim transaction.
+//   - destination: scopes delivery to one external system.
+//   - workerID: identifies the publisher replica.
+//   - lease: defines the PostgreSQL-clock ownership interval.
+//   - limit: caps messages claimed with SKIP LOCKED.
+//
+// Returns:
+//   - claims: contains immutable payloads and independent delivery fences.
+//   - error: reports invalid arguments, decoding failure, or database error.
+func (s *Store) ClaimOutbox(ctx context.Context, destination, workerID string, lease time.Duration, limit int) ([]OutboxClaim, error) {
+	if strings.TrimSpace(destination) == "" || strings.TrimSpace(workerID) == "" || lease <= 0 || limit < 1 {
+		return nil, fmt.Errorf("outbox claim arguments are invalid")
+	}
+	rows, err := s.pool.Query(ctx, `WITH due AS (
+SELECT candidate.outbox_id FROM conformance_outbox candidate
+WHERE candidate.destination=$1 AND candidate.delivered_at IS NULL AND candidate.next_attempt_at<=now() AND (candidate.lease_until IS NULL OR candidate.lease_until<now())
+AND (candidate.destination<>'registry' OR NOT EXISTS (
+  SELECT 1 FROM conformance_outbox earlier
+  WHERE earlier.destination=candidate.destination AND earlier.assignment_id=candidate.assignment_id AND earlier.delivered_at IS NULL
+  AND (earlier.assignment_generation,earlier.evaluation_revision)<(candidate.assignment_generation,candidate.evaluation_revision)
+))
+ORDER BY candidate.next_attempt_at,candidate.outbox_id FOR UPDATE OF candidate SKIP LOCKED LIMIT $2
+), claimed AS (
+UPDATE conformance_outbox o SET lease_owner=$3,lease_generation=o.lease_generation+1,lease_until=now()+$4::interval,attempt_count=o.attempt_count+1,updated_at=now()
+FROM due WHERE o.outbox_id=due.outbox_id
+RETURNING o.outbox_id,o.destination,o.idempotency_key,o.assignment_id,o.assignment_generation,o.evaluation_revision,o.payload,o.lease_generation,o.lease_until,o.attempt_count)
+SELECT c.outbox_id,c.destination,c.idempotency_key,a.specification,c.evaluation_revision,c.payload,c.lease_generation,c.lease_until,c.attempt_count
+FROM claimed c JOIN conformance_assignments a ON a.assignment_id=c.assignment_id AND a.assignment_generation=c.assignment_generation
+ORDER BY c.outbox_id`, destination, limit, workerID, lease.String())
+	if err != nil {
+		return nil, fmt.Errorf("claim %s outbox: %w", destination, err)
+	}
+	defer rows.Close()
+	claims := make([]OutboxClaim, 0, limit)
+	for rows.Next() {
+		var assignmentPayload, evaluationPayload []byte
+		var claim OutboxClaim
+		claim.WorkerID = workerID
+		if err = rows.Scan(&claim.ID, &claim.Destination, &claim.IdempotencyKey, &assignmentPayload, &claim.EvaluationRevision, &evaluationPayload, &claim.LeaseGeneration, &claim.LeaseUntil, &claim.AttemptCount); err != nil {
+			return nil, fmt.Errorf("scan outbox claim: %w", err)
+		}
+		if err = json.Unmarshal(assignmentPayload, &claim.Assignment); err != nil {
+			return nil, fmt.Errorf("decode outbox assignment: %w", err)
+		}
+		if err = json.Unmarshal(evaluationPayload, &claim.Evaluation); err != nil {
+			return nil, fmt.Errorf("decode outbox evaluation: %w", err)
+		}
+		claims = append(claims, claim)
+	}
+	return claims, rows.Err()
+}
+
+// MarkOutboxDelivered records successful delivery only while the exact
+// PostgreSQL-clock delivery lease remains current and unexpired.
+//
+// Parameters:
+//   - ctx: controls the fenced update.
+//   - claim: supplies message identity, worker ownership, and lease generation.
+//
+// Returns:
+//   - error: is ErrOutboxLeaseLost after expiry, takeover, or prior completion.
+func (s *Store) MarkOutboxDelivered(ctx context.Context, claim OutboxClaim) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_outbox SET delivered_at=now(),lease_owner=NULL,lease_until=NULL,last_error=NULL,updated_at=now() WHERE outbox_id=$1 AND destination=$2 AND lease_owner=$3 AND lease_generation=$4 AND lease_until>now() AND delivered_at IS NULL`, claim.ID, claim.Destination, claim.WorkerID, claim.LeaseGeneration)
+	if err != nil {
+		return fmt.Errorf("mark outbox delivered: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrOutboxLeaseLost
+	}
+	return nil
+}
+
+// RetryOutbox releases one current delivery lease and schedules a bounded
+// PostgreSQL-clock retry without changing its idempotency key or payload.
+//
+// Parameters:
+//   - ctx: controls the fenced update.
+//   - claim: supplies message identity, worker ownership, and lease generation.
+//   - delay: is the positive delay before another publisher may claim it.
+//   - deliveryErr: is recorded in bounded form for operator diagnosis.
+//
+// Returns:
+//   - error: is ErrOutboxLeaseLost after expiry, takeover, or completion.
+func (s *Store) RetryOutbox(ctx context.Context, claim OutboxClaim, delay time.Duration, deliveryErr error) error {
+	if delay <= 0 || deliveryErr == nil {
+		return fmt.Errorf("outbox retry delay and delivery error are required")
+	}
+	message := deliveryErr.Error()
+	if len(message) > 2048 {
+		message = message[:2048]
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_outbox SET next_attempt_at=now()+$1::interval,lease_owner=NULL,lease_until=NULL,last_error=$2,updated_at=now() WHERE outbox_id=$3 AND destination=$4 AND lease_owner=$5 AND lease_generation=$6 AND lease_until>now() AND delivered_at IS NULL`, delay.String(), message, claim.ID, claim.Destination, claim.WorkerID, claim.LeaseGeneration)
+	if err != nil {
+		return fmt.Errorf("schedule outbox retry: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrOutboxLeaseLost
 	}
 	return nil
 }

@@ -40,9 +40,16 @@ services:
       AERO_CONFORMANCE_INFLUX_TOKEN: local-development-no-auth
       AERO_CONFORMANCE_INFLUX_DATABASE: conformance
       AERO_CONFORMANCE_WORKER_ID: compose-1
-    ports: ["127.0.0.1:2112:2112"]
+      AERO_CONFORMANCE_REGISTRY_ADDRESS: registry:50051
+      AERO_CONFORMANCE_GRPC_CERTIFICATE_FILE: /run/secrets/conformance-grpc/tls.crt
+      AERO_CONFORMANCE_GRPC_PRIVATE_KEY_FILE: /run/secrets/conformance-grpc/tls.key
+      AERO_CONFORMANCE_GRPC_CLIENT_CA_FILE: /run/secrets/conformance-grpc/client-ca.crt
+    ports:
+      - "127.0.0.1:2112:2112"
+      - "127.0.0.1:50052:50052"
     volumes:
       - ./configs/config.yaml:/etc/aero-arc/config.yaml:ro
+      - ${AERO_CONFORMANCE_GRPC_TLS_DIR:-./configs/tls}:/run/secrets/conformance-grpc:ro
 
 volumes:
   postgres-data:

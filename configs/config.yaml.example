@@ -1,5 +1,10 @@
 service:
   management_address: ":2112"
+  grpc_address: ":50052"
+  grpc_tls:
+    certificate_file: "${AERO_CONFORMANCE_GRPC_CERTIFICATE_FILE}"
+    private_key_file: "${AERO_CONFORMANCE_GRPC_PRIVATE_KEY_FILE}"
+    client_ca_file: "${AERO_CONFORMANCE_GRPC_CLIENT_CA_FILE}"
   shutdown_timeout: 15s
 
 postgres:
@@ -14,6 +19,15 @@ influx:
   settle_delay: 2s
   aircraft_batch_size: 100
   max_rows: 10000
+
+registry:
+  address: "${AERO_CONFORMANCE_REGISTRY_ADDRESS}"
+  insecure: true
+  publish_interval: 1s
+  request_timeout: 3s
+  lease_duration: 10s
+  retry_delay: 5s
+  batch_size: 20
 
 worker:
   id: "${AERO_CONFORMANCE_WORKER_ID}"

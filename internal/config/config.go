@@ -20,6 +20,7 @@ type Config struct {
 	Service  Service  `yaml:"service"`
 	Postgres Postgres `yaml:"postgres"`
 	Influx   Influx   `yaml:"influx"`
+	Registry Registry `yaml:"registry"`
 	Worker   Worker   `yaml:"worker"`
 	Policy   Policy   `yaml:"policy"`
 	Logging  Logging  `yaml:"logging"`
@@ -50,7 +51,23 @@ func (d Duration) Value() time.Duration { return time.Duration(d) }
 
 type Service struct {
 	ManagementAddress string   `yaml:"management_address"`
+	GRPCAddress       string   `yaml:"grpc_address"`
+	GRPCTLS           GRPCTLS  `yaml:"grpc_tls"`
 	ShutdownTimeout   Duration `yaml:"shutdown_timeout"`
+}
+type GRPCTLS struct {
+	CertificateFile string `yaml:"certificate_file"`
+	PrivateKeyFile  string `yaml:"private_key_file"`
+	ClientCAFile    string `yaml:"client_ca_file"`
+}
+type Registry struct {
+	Address         string   `yaml:"address"`
+	Insecure        bool     `yaml:"insecure"`
+	PublishInterval Duration `yaml:"publish_interval"`
+	RequestTimeout  Duration `yaml:"request_timeout"`
+	LeaseDuration   Duration `yaml:"lease_duration"`
+	RetryDelay      Duration `yaml:"retry_delay"`
+	BatchSize       int      `yaml:"batch_size"`
 }
 type Postgres struct {
 	URL string `yaml:"url"`
@@ -89,7 +106,7 @@ type Logging struct {
 // Returns:
 //   - result: is the Config value produced by Default.
 func Default() Config {
-	return Config{Service: Service{ManagementAddress: ":2112", ShutdownTimeout: Duration(15 * time.Second)}, Influx: Influx{PollInterval: Duration(time.Second), OverlapWindow: Duration(30 * time.Second), SettleDelay: Duration(2 * time.Second), AircraftBatchSize: 100, MaxRows: 10000}, Worker: Worker{LeaseDuration: Duration(30 * time.Second), RenewInterval: Duration(10 * time.Second), ClaimBatchSize: 20}, Policy: Policy{Version: "standard-v1", HorizontalToleranceM: 5, VerticalToleranceM: 3, OpenAfterSamples: 3, RecoverAfterSamples: 3, TelemetryFreshness: Duration(15 * time.Second)}, Logging: Logging{Level: "info", Format: "json"}}
+	return Config{Service: Service{ManagementAddress: ":2112", GRPCAddress: ":50052", ShutdownTimeout: Duration(15 * time.Second)}, Influx: Influx{PollInterval: Duration(time.Second), OverlapWindow: Duration(30 * time.Second), SettleDelay: Duration(2 * time.Second), AircraftBatchSize: 100, MaxRows: 10000}, Registry: Registry{Insecure: true, PublishInterval: Duration(time.Second), RequestTimeout: Duration(3 * time.Second), LeaseDuration: Duration(10 * time.Second), RetryDelay: Duration(5 * time.Second), BatchSize: 20}, Worker: Worker{LeaseDuration: Duration(30 * time.Second), RenewInterval: Duration(10 * time.Second), ClaimBatchSize: 20}, Policy: Policy{Version: "standard-v1", HorizontalToleranceM: 5, VerticalToleranceM: 3, OpenAfterSamples: 3, RecoverAfterSamples: 3, TelemetryFreshness: Duration(15 * time.Second)}, Logging: Logging{Level: "info", Format: "json"}}
 }
 
 // Load reads, decodes, and validates Conformance configuration from a YAML file.
@@ -129,14 +146,20 @@ func Load(path string) (Config, error) {
 // Returns:
 //   - error: reports validation, dependency, cancellation, or persistence failures.
 func (c Config) Validate() error {
-	if strings.TrimSpace(c.Service.ManagementAddress) == "" || c.Service.ShutdownTimeout <= 0 {
-		return fmt.Errorf("service management address and positive shutdown timeout are required")
+	if strings.TrimSpace(c.Service.ManagementAddress) == "" || strings.TrimSpace(c.Service.GRPCAddress) == "" || c.Service.ShutdownTimeout <= 0 {
+		return fmt.Errorf("service management/grpc addresses and positive shutdown timeout are required")
+	}
+	if strings.TrimSpace(c.Service.GRPCTLS.CertificateFile) == "" || strings.TrimSpace(c.Service.GRPCTLS.PrivateKeyFile) == "" || strings.TrimSpace(c.Service.GRPCTLS.ClientCAFile) == "" {
+		return fmt.Errorf("service.grpc_tls certificate, private key, and client CA files are required")
 	}
 	if strings.TrimSpace(c.Postgres.URL) == "" {
 		return fmt.Errorf("postgres.url is required")
 	}
 	if strings.TrimSpace(c.Influx.Host) == "" || strings.TrimSpace(c.Influx.Database) == "" || c.Influx.PollInterval <= 0 || c.Influx.OverlapWindow <= 0 || c.Influx.SettleDelay < 0 || c.Influx.AircraftBatchSize < 1 || c.Influx.MaxRows < 1 {
 		return fmt.Errorf("influx configuration is incomplete")
+	}
+	if strings.TrimSpace(c.Registry.Address) == "" || c.Registry.PublishInterval <= 0 || c.Registry.RequestTimeout <= 0 || c.Registry.LeaseDuration <= c.Registry.RequestTimeout || c.Registry.RetryDelay <= 0 || c.Registry.BatchSize < 1 {
+		return fmt.Errorf("registry publisher configuration is invalid")
 	}
 	if strings.TrimSpace(c.Worker.ID) == "" || c.Worker.LeaseDuration <= 0 || c.Worker.RenewInterval <= 0 || c.Worker.RenewInterval >= c.Worker.LeaseDuration || c.Worker.ClaimBatchSize < 1 {
 		return fmt.Errorf("worker configuration is invalid")

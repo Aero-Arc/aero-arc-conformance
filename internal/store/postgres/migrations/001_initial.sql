@@ -175,6 +175,10 @@ CREATE INDEX IF NOT EXISTS conformance_outbox_due
   ON conformance_outbox (next_attempt_at, lease_until)
   WHERE delivered_at IS NULL;
 
+CREATE INDEX IF NOT EXISTS conformance_outbox_registry_order
+  ON conformance_outbox (destination, assignment_id, assignment_generation, evaluation_revision)
+  WHERE delivered_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS conformance_assignment_transitions (
   transition_id text PRIMARY KEY,
   source text NOT NULL,
