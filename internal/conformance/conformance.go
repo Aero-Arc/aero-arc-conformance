@@ -23,11 +23,13 @@ import (
 	postgresstore "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
 	telemetryinflux "github.com/aero-arc/aero-arc-conformance/internal/telemetry/influx"
 	conformancegrpc "github.com/aero-arc/aero-arc-conformance/internal/transport/grpc"
+	conformancev1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
 	registryv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/registry/v1"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	gogrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 )
 
 // Conformance owns the service's process resources, ingress servers, and
@@ -38,7 +40,7 @@ type Conformance struct {
 	store              *postgresstore.Store
 	reader             *telemetryinflux.Reader
 	managementServer   *http.Server
-	conformanceServer  *conformancegrpc.ConformanceServer
+	grpcServer         *gogrpc.Server
 	registryConnection *gogrpc.ClientConn
 	publisher          *registryprojection.Publisher
 	runCancel          context.CancelFunc
@@ -73,12 +75,15 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance
 		store.Close()
 		return nil, err
 	}
-	conformanceServer, err := conformancegrpc.New(store)
+	assignmentHandler, err := conformancegrpc.NewAssignmentHandler(store)
 	if err != nil {
 		_ = reader.Close()
 		store.Close()
 		return nil, err
 	}
+	grpcServer := gogrpc.NewServer()
+	conformancev1.RegisterConformanceServiceServer(grpcServer, assignmentHandler)
+	reflection.Register(grpcServer)
 	var transportCredentials credentials.TransportCredentials
 	if cfg.Registry.Insecure {
 		transportCredentials = insecure.NewCredentials()
@@ -103,7 +108,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*Conformance
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	conformance := &Conformance{cfg: cfg, log: log, store: store, reader: reader, conformanceServer: conformanceServer, registryConnection: registryConnection, publisher: publisher}
+	conformance := &Conformance{cfg: cfg, log: log, store: store, reader: reader, grpcServer: grpcServer, registryConnection: registryConnection, publisher: publisher}
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -143,7 +148,7 @@ func (c *Conformance) Run(ctx context.Context) error {
 		}
 	}()
 	go func() {
-		if serveErr := c.conformanceServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, gogrpc.ErrServerStopped) {
+		if serveErr := c.grpcServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, gogrpc.ErrServerStopped) {
 			errCh <- fmt.Errorf("assignment gRPC server: %w", serveErr)
 		}
 	}()
@@ -191,13 +196,13 @@ func (c *Conformance) Shutdown() error {
 		managementErr := c.managementServer.Shutdown(ctx)
 		grpcDone := make(chan struct{})
 		go func() {
-			c.conformanceServer.GracefulStop()
+			c.grpcServer.GracefulStop()
 			close(grpcDone)
 		}()
 		select {
 		case <-grpcDone:
 		case <-ctx.Done():
-			c.conformanceServer.Stop()
+			c.grpcServer.Stop()
 			<-grpcDone
 		}
 		connectionErr := c.registryConnection.Close()

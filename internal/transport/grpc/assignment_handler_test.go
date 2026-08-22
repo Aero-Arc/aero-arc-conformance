@@ -45,12 +45,12 @@ func (s *assignmentStoreStub) GetAssignment(context.Context, string, uint64) (do
 
 func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {
 	store := &assignmentStoreStub{}
-	server, err := New(store)
+	handler, err := NewAssignmentHandler(store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	response, err := server.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{
+	response, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{
 		Source: "api", MessageId: "message-1",
 		Assignment: &conformancev1.Assignment{
 			AssignmentId: "assignment-1", AssignmentGeneration: 7, AircraftId: "aircraft-1", AgentId: "agent-1",
@@ -68,17 +68,17 @@ func TestPrepareAssignmentMapsImmutableContract(t *testing.T) {
 }
 
 func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
-	server, err := New(&assignmentStoreStub{err: postgresstore.ErrStaleAssignment})
+	handler, err := NewAssignmentHandler(&assignmentStoreStub{err: postgresstore.ErrStaleAssignment})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{}); status.Code(err) != codes.InvalidArgument {
+	if _, err := handler.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("missing cutover timestamp error = %v", err)
 	}
-	if _, err := server.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := handler.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("stale assignment error = %v", err)
 	}
-	missing, err := New(&assignmentStoreStub{err: postgresstore.ErrAssignmentNotFound})
+	missing, err := NewAssignmentHandler(&assignmentStoreStub{err: postgresstore.ErrAssignmentNotFound})
 	if err != nil {
 		t.Fatal(err)
 	}

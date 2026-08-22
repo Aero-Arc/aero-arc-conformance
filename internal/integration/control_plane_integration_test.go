@@ -58,10 +58,12 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assignmentServer, err := assignmentgrpc.New(store)
+	assignmentHandler, err := assignmentgrpc.NewAssignmentHandler(store)
 	if err != nil {
 		t.Fatal(err)
 	}
+	assignmentServer := grpc.NewServer()
+	conformancev1.RegisterConformanceServiceServer(assignmentServer, assignmentHandler)
 	assignmentDone := make(chan error, 1)
 	go func() { assignmentDone <- assignmentServer.Serve(assignmentListener) }()
 	t.Cleanup(func() {
