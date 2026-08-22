@@ -62,16 +62,16 @@ func TestFlushAcknowledgesExactRegistryProjection(t *testing.T) {
 	}
 }
 
-func TestFlushCompletesStaleAndRetriesFailures(t *testing.T) {
+func TestFlushRetriesAmbiguousFailures(t *testing.T) {
 	claim := publisherTestClaim()
-	t.Run("stale cursor is obsolete", func(t *testing.T) {
+	t.Run("failed precondition is not proof of a higher cursor", func(t *testing.T) {
 		store := &publisherStoreStub{claims: []postgresstore.OutboxClaim{claim}}
 		client := &publisherClientStub{publish: func(*registryv1.PublishConformanceSummaryRequest) (*registryv1.PublishConformanceSummaryResponse, error) {
-			return nil, status.Error(codes.FailedPrecondition, "stale")
+			return nil, status.Error(codes.FailedPrecondition, "conflicting projection")
 		}}
 		_, err := newPublisherForTest(t, store, client).Flush(context.Background())
-		if err != nil || len(store.delivered) != 1 || len(store.retried) != 0 {
-			t.Fatalf("stale delivery delivered=%v retried=%v error=%v", store.delivered, store.retried, err)
+		if err == nil || len(store.delivered) != 0 || len(store.retried) != 1 {
+			t.Fatalf("ambiguous precondition delivered=%v retried=%v error=%v", store.delivered, store.retried, err)
 		}
 	})
 	t.Run("unavailable registry retries", func(t *testing.T) {

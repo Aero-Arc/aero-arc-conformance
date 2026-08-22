@@ -19,8 +19,6 @@ import (
 	conformancev1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
 	registryv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/registry/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -139,12 +137,11 @@ func (p *Publisher) publish(ctx context.Context, claim postgresstore.OutboxClaim
 	requestCtx, cancel := context.WithTimeout(ctx, p.config.RequestTimeout)
 	response, err := p.client.PublishConformanceSummary(requestCtx, request)
 	cancel()
-	if status.Code(err) == codes.FailedPrecondition {
-		// A higher Registry cursor already exists. This durable outbox item is
-		// obsolete, and exact generation/revision fencing makes completion safe.
-		return p.store.MarkOutboxDelivered(ctx, claim)
-	}
 	if err != nil {
+		// The Registry contract does not currently distinguish a provably higher
+		// cursor from same-cursor payload conflicts. Preserve the durable retry for
+		// every error until an exact acknowledgement or reconciliation contract can
+		// prove this projection obsolete.
 		return p.scheduleRetry(ctx, claim, err)
 	}
 	if err = validateAcknowledgement(request.GetSummary(), response); err != nil {
