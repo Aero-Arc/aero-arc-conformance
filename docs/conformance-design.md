@@ -211,6 +211,12 @@ an ambiguous rejection.
 Conformance publishes meaningful state transitions, severity changes, recording
 changes, and periodic freshness—not every telemetry frame.
 
+The current `CommitEvaluation` prototype still writes a checkpoint and Registry
+outbox row for every live commit; cadence separation, flight finalization, and
+safe pruning are planned rather than implemented. See
+[Scaling, Retention, and Flight Finalization](scaling-retention.md) for the
+capacity model, retention gates, and incremental roadmap.
+
 ## Failure principles
 
 - Postgres unavailable during breach: publish the live warning as recording
@@ -233,6 +239,10 @@ Before treating the current cross-repository contracts as production-ready, prov
 - restart and lease takeover mid-incident;
 - competing evaluators cannot commit or duplicate incidents;
 - polling performance for 100, 500, 1,000, and eventually 5,000 aircraft;
+- independent evaluation, checkpoint, and Registry heartbeat cadences under
+  steady state and transition bursts;
+- final reconciliation, verified archival, and replay-safe checkpoint/outbox
+  retention;
 - whether `aircraft_id` as an Influx field prevents adequate pruning;
 - explicit latency/error thresholds that would justify JetStream or Kafka.
 
