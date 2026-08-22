@@ -117,6 +117,15 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 			EffectiveFrom: timestamppb.New(effectiveFrom), EffectiveUntil: timestamppb.New(effectiveUntil),
 		}
 	}
+	assignmentWithAltitude := func(lower, upper float64) *conformancev1.Assignment {
+		assignment := validAssignment(1, now, now.Add(time.Hour))
+		assignment.Volumes = []*conformancev1.ConformanceVolume{{
+			VolumeId: "volume-1", AltitudeLowerM: lower, AltitudeUpperM: upper,
+			AltitudeReference: conformancev1.AltitudeReference_ALTITUDE_REFERENCE_MSL,
+			StartsAt:          timestamppb.New(now), EndsAt: timestamppb.New(now.Add(time.Hour)),
+		}}
+		return assignment
+	}
 	tests := map[string]func() error{
 		"prepare generation": func() error {
 			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-generation", Assignment: validAssignment(overflowGeneration, now, now.Add(time.Hour))})
@@ -124,6 +133,14 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 		},
 		"prepare timestamp": func() error {
 			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-time", Assignment: validAssignment(1, overflowTime, overflowTime.Add(time.Hour))})
+			return err
+		},
+		"prepare NaN altitude": func() error {
+			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-nan-altitude", Assignment: assignmentWithAltitude(math.NaN(), 120)})
+			return err
+		},
+		"prepare infinite altitude": func() error {
+			_, err := handler.PrepareAssignment(context.Background(), &conformancev1.PrepareAssignmentRequest{Source: "api", MessageId: "prepare-infinite-altitude", Assignment: assignmentWithAltitude(80, math.Inf(1))})
 			return err
 		},
 		"cancel generation": func() error {

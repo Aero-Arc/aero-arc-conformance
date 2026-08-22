@@ -180,6 +180,9 @@ func assignmentFromProto(value *conformancev1.Assignment) (domain.Assignment, er
 		if input == nil || input.GetStartsAt() == nil || input.GetEndsAt() == nil || input.GetStartsAt().CheckValid() != nil || input.GetEndsAt().CheckValid() != nil {
 			return domain.Assignment{}, fmt.Errorf("every volume requires valid start and end timestamps")
 		}
+		if math.IsNaN(input.GetAltitudeLowerM()) || math.IsInf(input.GetAltitudeLowerM(), 0) || math.IsNaN(input.GetAltitudeUpperM()) || math.IsInf(input.GetAltitudeUpperM(), 0) {
+			return domain.Assignment{}, fmt.Errorf("volume altitude bounds must be finite")
+		}
 		reference, ok := altitudeReferenceFromProto[input.GetAltitudeReference()]
 		if !ok {
 			return domain.Assignment{}, fmt.Errorf("volume altitude reference is invalid")
