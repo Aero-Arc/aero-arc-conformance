@@ -1,8 +1,8 @@
 # Deployment
 
 The prototype initializes numbered migrations and clients, serves management
-HTTP and assignment lifecycle gRPC, and drains committed Registry projection
-outbox messages. It still has no telemetry claim/evaluate worker loop.
+HTTP and assignment lifecycle gRPC, runs the live telemetry claim/evaluate
+worker, and drains committed Registry projection outbox messages.
 The tested store is designed for multiple replicas: advisory-locked migrations,
 revision-fenced commits, and assignment leases prevent competing commits.
 
@@ -11,9 +11,14 @@ management network. Readiness requires initialized migrations and reachable
 PostgreSQL. Future production readiness will also include Influx query health,
 Registry projection delivery health, and a running telemetry claim loop.
 
-Current graceful shutdown stops readiness, assignment gRPC, Registry delivery,
-management HTTP, and clients within a bounded timeout. The worker slice must
-extend this to stop new telemetry claims and fence active evaluation work.
+Current graceful shutdown cancels new telemetry claims and in-flight reads and
+renewals before stopping assignment gRPC, Registry delivery, management HTTP,
+and clients within a bounded timeout. Any uncommitted claim remains fenced until
+its PostgreSQL lease expires.
+
+Relay must deploy the `wal_id` field before this binary is considered ready for
+live telemetry. A missing field terminates the evaluator worker and therefore
+the service instead of silently advancing a sequence-only checkpoint.
 
 The assignment gRPC listener requires a server certificate/private key and a
 client CA. API callers must present a certificate chaining to that CA; startup

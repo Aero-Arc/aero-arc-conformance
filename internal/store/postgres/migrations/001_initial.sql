@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS conformance_checkpoints (
   assignment_generation bigint NOT NULL,
   evaluation_revision bigint NOT NULL,
   state_through_at timestamptz NOT NULL,
+  state_through_at_unix_ns bigint NOT NULL,
   wal_id text NOT NULL,
   wal_sequence bigint NOT NULL CHECK (wal_sequence >= 0),
   frame_id text NOT NULL,

@@ -59,12 +59,17 @@ boundaries unless an accepted design change explicitly moves them:
 - Merged telemetry does not yet contain `wal_id`.
 - Relay currently acknowledges queue admission before durable InfluxDB flush;
   audit-grade conformance requires that acknowledged-loss gap to be closed.
-- The assignment gRPC and Registry outbox publisher are wired; the telemetry
-  claim/poll/evaluate loop remains the next runtime slice.
+- The assignment gRPC, live telemetry evaluator worker, and Registry outbox
+  publisher are wired. Runtime evaluation remains deployment-gated by `wal_id`.
 - The reader is forward-contract-only and must fail loudly until Agent and Relay
   provide `wal_id`; do not add a silent sequence-only fallback.
-- Reader overlap currently deduplicates within a returned window. Persistent
-  overlap replay semantics must be finalized before production checkpointing.
+- Runtime overlap rereads from before the latest checkpoint and evaluates only
+  the canonical suffix after its durable cursor. Reconciliation of observations
+  that become visible behind that cursor remains unimplemented and must be
+  finalized before audit-grade production checkpointing.
+- Empty and failed telemetry reads currently reschedule without a monitoring-only
+  commit. Until a separately fenced freshness projection exists, Registry can
+  retain `current` from the last evaluated frame until its own TTL expires.
 - The real integration proves checkpoint restoration and fenced suffix takeover,
   but does not yet prove delayed Influx visibility or same-timestamp pagination.
 

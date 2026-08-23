@@ -25,7 +25,10 @@ const (
 	schemaVersion   = "1"
 )
 
-var ErrWALIdentityUnavailable = errors.New("telemetry WAL identity is unavailable; deploy the Agent and Relay wal_id contract before enabling Conformance")
+var (
+	ErrWALIdentityUnavailable = errors.New("telemetry WAL identity is unavailable; deploy the Agent and Relay wal_id contract before enabling Conformance")
+	ErrWindowSaturated        = errors.New("telemetry window is saturated")
+)
 
 type QueryRunner interface {
 	Query(context.Context, string, map[string]any) ([]map[string]any, error)
@@ -162,7 +165,7 @@ func (r *Reader) ReadPositions(ctx context.Context, aircraftIDs []string, start,
 			return ReadResult{}, err
 		}
 		if len(rows) >= r.maxRows {
-			return ReadResult{}, fmt.Errorf("telemetry window overflow: chunk returned limit %d; split the window", r.maxRows)
+			return ReadResult{}, fmt.Errorf("%w: chunk returned limit %d; split the window", ErrWindowSaturated, r.maxRows)
 		}
 		for _, row := range rows {
 			o, err := decodeObservation(row)

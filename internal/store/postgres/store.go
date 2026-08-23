@@ -639,6 +639,9 @@ func recordLifecycleCommand(ctx context.Context, tx pgx.Tx, source, messageID, m
 
 type Claim struct {
 	Assignment         domain.Assignment
+	AuthorityFrom      time.Time
+	AuthorityUntil     time.Time
+	FinalizationGrace  time.Duration
 	WorkerID           string
 	LeaseGeneration    uint64
 	LeaseUntil         time.Time
@@ -658,18 +661,38 @@ type Claim struct {
 //   - claims: contain assignment, lease generation, expiry, and expected revision.
 //   - error: reports invalid arguments, database failure, or specification decoding.
 func (s *Store) ClaimDueAssignments(ctx context.Context, workerID string, lease time.Duration, limit int) ([]Claim, error) {
-	if workerID == "" || lease <= 0 || limit < 1 {
+	return s.ClaimDueAssignmentsWithFinalizationGrace(ctx, workerID, lease, 0, limit)
+}
+
+// ClaimDueAssignmentsWithFinalizationGrace atomically leases due live
+// assignments, including an ended authority interval only during a bounded
+// settle-and-scheduling grace so its final half-open telemetry tail can be queried.
+//
+// Parameters:
+//   - ctx: controls the claim transaction.
+//   - workerID: identifies the evaluator replica acquiring ownership.
+//   - lease: defines the PostgreSQL-clock ownership interval.
+//   - finalizationGrace: keeps an ended interval claimable only long enough for
+//     telemetry settling plus one scheduling interval; it never extends event authority.
+//   - limit: caps assignments claimed in one transaction.
+//
+// Returns:
+//   - claims: contain assignment, authority interval, independent lease fence,
+//     expected evaluation revision, and final-tail grace.
+//   - error: reports invalid arguments, database failure, or specification decoding.
+func (s *Store) ClaimDueAssignmentsWithFinalizationGrace(ctx context.Context, workerID string, lease, finalizationGrace time.Duration, limit int) ([]Claim, error) {
+	if workerID == "" || lease <= 0 || finalizationGrace < 0 || limit < 1 {
 		return nil, fmt.Errorf("claim arguments are invalid")
 	}
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 SELECT assignment_id,assignment_generation FROM conformance_assignments
-WHERE lifecycle_state IN ('active','ending') AND authority_until>now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
+WHERE lifecycle_state IN ('active','ending') AND authority_until+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
 ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
 FROM due WHERE a.assignment_id=due.assignment_id AND a.assignment_generation=due.assignment_generation
-RETURNING a.specification,a.lease_generation,a.lease_until,a.evaluation_revision)
-SELECT specification,lease_generation,lease_until,evaluation_revision FROM claimed`, limit, workerID, lease.String())
+RETURNING a.specification,a.authority_from_unix_ns,a.authority_until_unix_ns,a.lease_generation,a.lease_until,a.evaluation_revision)
+SELECT specification,authority_from_unix_ns,authority_until_unix_ns,lease_generation,lease_until,evaluation_revision FROM claimed`, limit, workerID, lease.String(), finalizationGrace.String())
 	if err != nil {
 		return nil, fmt.Errorf("claim assignments: %w", err)
 	}
@@ -677,17 +700,48 @@ SELECT specification,lease_generation,lease_until,evaluation_revision FROM claim
 	claims := make([]Claim, 0, limit)
 	for rows.Next() {
 		var raw []byte
+		var authorityFromUnixNS, authorityUntilUnixNS int64
 		var c Claim
 		c.WorkerID = workerID
-		if err = rows.Scan(&raw, &c.LeaseGeneration, &c.LeaseUntil, &c.EvaluationRevision); err != nil {
+		c.FinalizationGrace = finalizationGrace
+		if err = rows.Scan(&raw, &authorityFromUnixNS, &authorityUntilUnixNS, &c.LeaseGeneration, &c.LeaseUntil, &c.EvaluationRevision); err != nil {
 			return nil, err
 		}
+		c.AuthorityFrom = time.Unix(0, authorityFromUnixNS).UTC()
+		c.AuthorityUntil = time.Unix(0, authorityUntilUnixNS).UTC()
 		if err = json.Unmarshal(raw, &c.Assignment); err != nil {
 			return nil, fmt.Errorf("decode assignment: %w", err)
 		}
 		claims = append(claims, c)
 	}
 	return claims, rows.Err()
+}
+
+// DeferAssignmentEvaluation releases a claimed assignment and moves its next
+// due time without advancing its evaluation revision or durable telemetry
+// watermark. It is used when no complete evaluable suffix is available.
+//
+// Parameters:
+//   - ctx: controls the fenced update.
+//   - claim: carries the exact worker and lease-generation ownership fences.
+//   - nextEvaluationAt: schedules the next attempt without recording evidence.
+//
+// Returns:
+//   - error: reports an invalid schedule, database failure, or ErrLeaseLost when
+//     the lease expired or any assignment, worker, generation, revision, or
+//     lifecycle fence no longer matches.
+func (s *Store) DeferAssignmentEvaluation(ctx context.Context, claim Claim, nextEvaluationAt time.Time) error {
+	if nextEvaluationAt.IsZero() {
+		return fmt.Errorf("next evaluation time is required")
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND authority_until+$7::interval>=now() AND lifecycle_state IN ('active','ending')`, nextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, claim.FinalizationGrace.String())
+	if err != nil {
+		return fmt.Errorf("defer assignment evaluation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 // RenewAssignmentLease extends an unexpired lease only when the caller still
@@ -705,7 +759,7 @@ func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND authority_until>now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration)
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND authority_until+$6::interval>=now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.FinalizationGrace.String())
 	if err != nil {
 		return fmt.Errorf("renew assignment lease: %w", err)
 	}
@@ -745,14 +799,16 @@ type ReplayCheckpoint struct {
 //   - error: reports database or evaluator-state decoding failure.
 func (s *Store) GetReplayCheckpoint(ctx context.Context, assignmentID string, generation uint64, atOrBefore time.Time) (ReplayCheckpoint, bool, error) {
 	var checkpoint ReplayCheckpoint
+	var stateThroughUnixNS int64
 	var state []byte
-	err := s.pool.QueryRow(ctx, `SELECT evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2 AND state_through_at<=$3 ORDER BY state_through_at DESC,wal_id DESC,wal_sequence DESC,frame_id DESC LIMIT 1`, assignmentID, generation, atOrBefore).Scan(&checkpoint.EvaluationRevision, &checkpoint.StateThroughAt, &checkpoint.WALID, &checkpoint.WALSequence, &checkpoint.FrameID, &state)
+	err := s.pool.QueryRow(ctx, `SELECT evaluation_revision,state_through_at_unix_ns,wal_id,wal_sequence,frame_id,evaluator_state FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2 AND state_through_at_unix_ns<=$3 ORDER BY state_through_at_unix_ns DESC,wal_id DESC,wal_sequence DESC,frame_id DESC LIMIT 1`, assignmentID, generation, atOrBefore.UnixNano()).Scan(&checkpoint.EvaluationRevision, &stateThroughUnixNS, &checkpoint.WALID, &checkpoint.WALSequence, &checkpoint.FrameID, &state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ReplayCheckpoint{}, false, nil
 	}
 	if err != nil {
 		return ReplayCheckpoint{}, false, fmt.Errorf("read replay checkpoint: %w", err)
 	}
+	checkpoint.StateThroughAt = time.Unix(0, stateThroughUnixNS).UTC()
 	if err = json.Unmarshal(state, &checkpoint.State); err != nil {
 		return ReplayCheckpoint{}, false, fmt.Errorf("decode replay checkpoint: %w", err)
 	}
@@ -936,10 +992,14 @@ type transitionEvidence struct {
 
 func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignment, revision uint64, evaluation domain.Evaluation, allowEqualWatermark, publishLive bool) error {
 	var currentObservedUnixNS int64
-	err := tx.QueryRow(ctx, `SELECT observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2 FOR UPDATE`, assignment.ID, assignment.Generation).Scan(&currentObservedUnixNS)
-	evaluationUnixNS := evaluation.ObservedAt.UnixNano()
-	if err == nil && (evaluationUnixNS < currentObservedUnixNS || (!allowEqualWatermark && evaluationUnixNS == currentObservedUnixNS)) {
-		return ErrStaleEvaluation
+	var currentWALID, currentFrameID string
+	var currentWALSequence uint64
+	err := tx.QueryRow(ctx, `SELECT state_through_at_unix_ns,wal_id,wal_sequence,frame_id FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2 ORDER BY evaluation_revision DESC LIMIT 1 FOR UPDATE`, assignment.ID, assignment.Generation).Scan(&currentObservedUnixNS, &currentWALID, &currentWALSequence, &currentFrameID)
+	if err == nil {
+		comparison := compareEvaluationCursor(evaluation, currentObservedUnixNS, currentWALID, currentWALSequence, currentFrameID)
+		if comparison < 0 || (comparison == 0 && !allowEqualWatermark) {
+			return ErrStaleEvaluation
+		}
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("read live watermark: %w", err)
@@ -1019,7 +1079,7 @@ RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, 
 			}
 		}
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, assignment.ID, assignment.Generation, revision, evaluation.ObservedAt, evaluation.WALID, evaluation.WALSequence, evaluation.FrameID, state); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO conformance_checkpoints(assignment_id,assignment_generation,evaluation_revision,state_through_at,state_through_at_unix_ns,wal_id,wal_sequence,frame_id,evaluator_state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, assignment.ID, assignment.Generation, revision, evaluation.ObservedAt, evaluation.ObservedAt.UnixNano(), evaluation.WALID, evaluation.WALSequence, evaluation.FrameID, state); err != nil {
 		return fmt.Errorf("insert checkpoint: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,observed_at_unix_ns,frame_id,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(assignment_id,assignment_generation) DO UPDATE SET evaluation_revision=EXCLUDED.evaluation_revision,condition=EXCLUDED.condition,monitoring_status=EXCLUDED.monitoring_status,recording_status=EXCLUDED.recording_status,observed_at=EXCLUDED.observed_at,observed_at_unix_ns=EXCLUDED.observed_at_unix_ns,frame_id=EXCLUDED.frame_id,payload=EXCLUDED.payload,updated_at=now()`, assignment.ID, assignment.Generation, revision, evaluation.Condition, evaluation.Monitoring, domain.RecordingConfirmed, evaluation.ObservedAt, evaluation.ObservedAt.UnixNano(), evaluation.FrameID, payload); err != nil {
@@ -1032,6 +1092,25 @@ RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, 
 		}
 	}
 	return nil
+}
+
+func compareEvaluationCursor(evaluation domain.Evaluation, observedUnixNS int64, walID string, walSequence uint64, frameID string) int {
+	if evaluationUnixNS := evaluation.ObservedAt.UnixNano(); evaluationUnixNS != observedUnixNS {
+		if evaluationUnixNS < observedUnixNS {
+			return -1
+		}
+		return 1
+	}
+	if evaluation.WALID != walID {
+		return strings.Compare(evaluation.WALID, walID)
+	}
+	if evaluation.WALSequence != walSequence {
+		if evaluation.WALSequence < walSequence {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(evaluation.FrameID, frameID)
 }
 
 // OutboxClaim is one PostgreSQL-clock lease over an undelivered integration
