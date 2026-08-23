@@ -261,7 +261,7 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 		t.Fatalf("claim lost exact authority bounds: got [%s,%s), want [%s,%s)", precisionClaim.AuthorityFrom, precisionClaim.AuthorityUntil, precisionStart, precisionEnd)
 	}
 	precisionObservedAt := precisionStart.Add(time.Second).Add(317 * time.Nanosecond)
-	if err = store.CommitEvaluation(ctx, precisionClaim, postgresstore.EvaluationCommit{Evaluation: sampleEvaluation(precisionObservedAt), NextEvaluationAt: time.Now().Add(time.Minute)}); err != nil {
+	if err = store.CommitEvaluation(ctx, precisionClaim, postgresstore.EvaluationCommit{Evaluation: sampleEvaluation(precisionObservedAt), NextEvaluationAt: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatalf("commit nanosecond checkpoint: %v", err)
 	}
 	if _, found, err = store.GetReplayCheckpoint(ctx, precisionAssignment.ID, precisionAssignment.Generation, precisionObservedAt.Add(-time.Nanosecond)); err != nil || found {
@@ -270,6 +270,29 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 	precisionCheckpoint, found, err := store.GetReplayCheckpoint(ctx, precisionAssignment.ID, precisionAssignment.Generation, precisionObservedAt)
 	if err != nil || !found || !precisionCheckpoint.StateThroughAt.Equal(precisionObservedAt) {
 		t.Fatalf("checkpoint lost exact nanosecond cursor: checkpoint=%#v found=%v err=%v", precisionCheckpoint, found, err)
+	}
+	precisionClaims, err = store.ClaimDueAssignments(ctx, "nanosecond-worker", 5*time.Second, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	precisionClaim = postgresstore.Claim{}
+	for _, claim := range precisionClaims {
+		if claim.Assignment.ID == precisionAssignment.ID {
+			precisionClaim = claim
+		}
+	}
+	if precisionClaim.Assignment.ID == "" {
+		t.Fatalf("nanosecond assignment was not reclaimed: %#v", precisionClaims)
+	}
+	sameTimeLaterCursor := sampleEvaluation(precisionObservedAt)
+	sameTimeLaterCursor.WALSequence = 2
+	sameTimeLaterCursor.FrameID = "blue-frame-2"
+	if err = store.CommitEvaluation(ctx, precisionClaim, postgresstore.EvaluationCommit{Evaluation: sameTimeLaterCursor, NextEvaluationAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("commit later same-time cursor: %v", err)
+	}
+	precisionCheckpoint, found, err = store.GetReplayCheckpoint(ctx, precisionAssignment.ID, precisionAssignment.Generation, precisionObservedAt)
+	if err != nil || !found || precisionCheckpoint.WALSequence != 2 || precisionCheckpoint.FrameID != sameTimeLaterCursor.FrameID {
+		t.Fatalf("later same-time cursor did not advance: checkpoint=%#v found=%v err=%v", precisionCheckpoint, found, err)
 	}
 
 	t.Run("blue-green assignment cutover", func(t *testing.T) {

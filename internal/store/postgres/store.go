@@ -992,10 +992,14 @@ type transitionEvidence struct {
 
 func writeEvaluation(ctx context.Context, tx pgx.Tx, assignment domain.Assignment, revision uint64, evaluation domain.Evaluation, allowEqualWatermark, publishLive bool) error {
 	var currentObservedUnixNS int64
-	err := tx.QueryRow(ctx, `SELECT observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2 FOR UPDATE`, assignment.ID, assignment.Generation).Scan(&currentObservedUnixNS)
-	evaluationUnixNS := evaluation.ObservedAt.UnixNano()
-	if err == nil && (evaluationUnixNS < currentObservedUnixNS || (!allowEqualWatermark && evaluationUnixNS == currentObservedUnixNS)) {
-		return ErrStaleEvaluation
+	var currentWALID, currentFrameID string
+	var currentWALSequence uint64
+	err := tx.QueryRow(ctx, `SELECT state_through_at_unix_ns,wal_id,wal_sequence,frame_id FROM conformance_checkpoints WHERE assignment_id=$1 AND assignment_generation=$2 ORDER BY evaluation_revision DESC LIMIT 1 FOR UPDATE`, assignment.ID, assignment.Generation).Scan(&currentObservedUnixNS, &currentWALID, &currentWALSequence, &currentFrameID)
+	if err == nil {
+		comparison := compareEvaluationCursor(evaluation, currentObservedUnixNS, currentWALID, currentWALSequence, currentFrameID)
+		if comparison < 0 || (comparison == 0 && !allowEqualWatermark) {
+			return ErrStaleEvaluation
+		}
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("read live watermark: %w", err)
@@ -1088,6 +1092,25 @@ RETURNING event_id`, eventID, assignment.ID, assignment.Generation, incidentID, 
 		}
 	}
 	return nil
+}
+
+func compareEvaluationCursor(evaluation domain.Evaluation, observedUnixNS int64, walID string, walSequence uint64, frameID string) int {
+	if evaluationUnixNS := evaluation.ObservedAt.UnixNano(); evaluationUnixNS != observedUnixNS {
+		if evaluationUnixNS < observedUnixNS {
+			return -1
+		}
+		return 1
+	}
+	if evaluation.WALID != walID {
+		return strings.Compare(evaluation.WALID, walID)
+	}
+	if evaluation.WALSequence != walSequence {
+		if evaluation.WALSequence < walSequence {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(evaluation.FrameID, frameID)
 }
 
 // OutboxClaim is one PostgreSQL-clock lease over an undelivered integration
