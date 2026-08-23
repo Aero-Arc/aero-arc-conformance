@@ -46,8 +46,8 @@ boundaries unless an accepted design change explicitly moves them:
 - Evaluator batches must preserve the reader's canonical `(event time, agent,
   WAL identity, WAL sequence, frame)` order; equal-time frames are not freely
   interchangeable because incident hysteresis is order-sensitive.
-- Stable `frame_id` provides idempotency. A future `wal_id` plus WAL sequence
-  provides ordering within one Agent WAL generation.
+- Stable `frame_id` provides idempotency. `wal_id` plus WAL sequence provides
+  ordering within one Agent WAL generation.
 - Sequence gaps are normal because the Agent WAL contains all MAVLink messages.
 - A late observation may amend history but must not roll current live state back.
 - Unknown or incompatible altitude reference is not a vertical violation.
@@ -56,13 +56,14 @@ boundaries unless an accepted design change explicitly moves them:
 
 ## Current prototype limitations
 
-- Merged telemetry does not yet contain `wal_id`.
+- Telemetry written before the Agent/Relay `wal_id` rollout is not compatible
+  with live evaluation and must not receive a sequence-only fallback.
 - Relay currently acknowledges queue admission before durable InfluxDB flush;
   audit-grade conformance requires that acknowledged-loss gap to be closed.
 - The assignment gRPC and Registry outbox publisher are wired; the telemetry
   claim/poll/evaluate loop remains the next runtime slice.
-- The reader is forward-contract-only and must fail loudly until Agent and Relay
-  provide `wal_id`; do not add a silent sequence-only fallback.
+- The reader is forward-contract-only and must fail loudly when `wal_id` is
+  unavailable; do not add a silent sequence-only fallback.
 - Reader overlap currently deduplicates within a returned window. Persistent
   overlap replay semantics must be finalized before production checkpointing.
 - The real integration proves checkpoint restoration and fenced suffix takeover,

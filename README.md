@@ -38,9 +38,9 @@ interrupt Relay telemetry acknowledgement or storage.
   logging, strict YAML configuration, and bounded shutdown.
 - Real Postgres and InfluxDB integration coverage through Testcontainers.
 
-The reader deliberately fails with `ErrWALIdentityUnavailable` against today’s
-merged Relay schema, because that schema does not yet carry `wal_id`. This is a
-deployment gate, not a legacy mode that can quietly weaken replay correctness.
+The reader deliberately fails with `ErrWALIdentityUnavailable` for telemetry
+written before the Agent/Relay `wal_id` rollout. This remains a deployment gate,
+not a legacy mode that can quietly weaken replay correctness.
 
 ## Quick start
 
@@ -60,7 +60,7 @@ go run ./cmd/aero-arc-conformance --config-path configs/config.yaml
 
 `go run` accepts assignment lifecycle commands and publishes any committed
 Registry outbox rows. It will not evaluate telemetry until the worker runtime
-slice lands and Relay supplies the required `wal_id` contract.
+slice lands and the deployed Agent/Relay path supplies the required `wal_id`.
 
 Assignment gRPC defaults to `:50052` and requires an API client certificate
 signed by the configured client CA. Management endpoints default to:

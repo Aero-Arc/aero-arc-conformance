@@ -66,10 +66,12 @@ transaction. See [Blue-green assignment cutover](assignment-cutover.md).
 
 The merged Relay table is `aircraft_telemetry`. `agent_id`, `frame_id`,
 `message_name`, and `schema_version` are tags. Aircraft, flight, intent, Relay,
-session, and `wal_sequence` are fields. Point `time` is Agent capture time.
+session, `wal_id`, and `wal_sequence` are fields. Point `time` is Agent capture
+time.
 
-The production contract needs a stable random `wal_id` created with the Agent's
-SQLite WAL. The processing identity becomes:
+The production contract uses a stable random `wal_id` created with the Agent's
+SQLite WAL. It survives Agent process restarts and changes when the WAL database
+is recreated. The processing identity is:
 
 ```text
 agent_id + wal_id + wal_sequence   ordering inside a WAL generation
@@ -77,7 +79,7 @@ frame_id                           idempotency across retry and reconnect
 ```
 
 The forward-contract reader consumes only `global_position_int`. It refuses to
-start live evaluation when `wal_id` is unavailable, so current Relay rows cannot
+start live evaluation when `wal_id` is unavailable, so legacy Relay rows cannot
 silently resemble an empty telemetry window. It queries bounded
 half-open event-time windows for batches of aircraft, orders by event time and
 WAL identity, and deduplicates stable frames. It intentionally rejects a query
@@ -250,10 +252,11 @@ Before treating the current cross-repository contracts as production-ready, prov
 
 1. Stabilize this evaluator, store, reader, recovery integration, and implement
    the currently deferred workload benchmark.
-2. Protos define assignment lifecycle and Registry projection RPCs; telemetry
-   contracts still add WAL identity.
-3. Agent creates and transmits `wal_id`.
-4. Relay persists `wal_id` and closes the acknowledged-loss gap.
+2. Protos define assignment lifecycle, Registry projection RPCs, and WAL
+   generation identity.
+3. Agent creates, persists, and transmits `wal_id`.
+4. Relay validates and persists `wal_id`; closing the acknowledged-loss gap
+   remains separate durability work.
 5. Registry implements assignment fencing and TTL live projection.
 6. Conformance wires the assignment server and projection outbox; the telemetry
    worker loop follows after the reader gates are satisfied.
