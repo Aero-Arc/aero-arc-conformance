@@ -50,6 +50,14 @@ Relay writes telemetry independently. Conformance cannot enter Relay's ACK path.
 This is a saga, not a distributed transaction. Every stage must be idempotent,
 observable, and reconcilable.
 
+The assignment effective window is Conformance's processing authority, not the
+flight's planned authorization window. Operational-volume timestamps carry the
+authorized 4D plan. A coordinator must keep assignment authority open beyond
+the latest planned volume while the physical flight remains active, so telemetry
+after `planned_end_at` opens a temporal-deviation incident instead of silently
+ending monitoring. Explicit cancellation or completion closes monitoring; the
+clock alone never asserts that the aircraft landed.
+
 The API-to-Conformance assignment channel is mutually authenticated with TLS.
 Conformance verifies the API client certificate against its configured client
 CA before dispatching lifecycle RPCs; the command `source` only namespaces

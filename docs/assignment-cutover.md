@@ -51,7 +51,12 @@ capture time. A delayed frame received after cutover but captured before it is
 therefore evaluated against generation 7. A frame captured exactly at cutover
 belongs to generation 8. The replacement interval ends exclusively at its
 immutable `effective_until`; observations at or after that boundary have no
-assignment authority.
+assignment authority. This is a monitoring-authority boundary, not the end of
+the planned 4D authorization. Volume `ends_at` timestamps may occur earlier,
+and observations between the last authorized volume and `effective_until` are
+evaluated as temporal deviations. Mission lifecycle must leave enough
+monitoring authority for an active-aircraft overrun and explicitly end it after
+completion.
 
 Late evaluation does not revive a generation 7 lease. A worker holding the
 current generation 8 lease may call `CommitHistoricalEvaluation`; PostgreSQL

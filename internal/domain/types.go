@@ -69,15 +69,20 @@ type Volume struct {
 }
 
 type Assignment struct {
-	ID             string    `json:"assignment_id"`
-	Generation     uint64    `json:"assignment_generation"`
-	OperatorID     string    `json:"operator_id,omitempty"`
-	AircraftID     string    `json:"aircraft_id"`
-	AgentID        string    `json:"agent_id"`
-	FlightID       string    `json:"flight_id"`
-	IntentID       string    `json:"intent_id"`
-	IntentVersion  uint32    `json:"intent_version"`
-	PolicyVersion  string    `json:"policy_version"`
+	ID            string `json:"assignment_id"`
+	Generation    uint64 `json:"assignment_generation"`
+	OperatorID    string `json:"operator_id,omitempty"`
+	AircraftID    string `json:"aircraft_id"`
+	AgentID       string `json:"agent_id"`
+	FlightID      string `json:"flight_id"`
+	IntentID      string `json:"intent_id"`
+	IntentVersion uint32 `json:"intent_version"`
+	PolicyVersion string `json:"policy_version"`
+	// EffectiveFrom and EffectiveUntil bound Conformance's authority to process
+	// telemetry for this generation. They are not the planned authorization
+	// window: individual Volume windows carry that constraint, allowing an
+	// active flight to remain monitored as a temporal deviation after its plan
+	// ends and until mission lifecycle explicitly ends monitoring.
 	EffectiveFrom  time.Time `json:"effective_from"`
 	EffectiveUntil time.Time `json:"effective_until"`
 	Volumes        []Volume  `json:"volumes"`
