@@ -96,8 +96,9 @@ func TestAssignmentIngressAndRegistryOutboxAgainstPostgres(t *testing.T) {
 	if err != nil || prepared.GetAssignment().GetLifecycle() != conformancev1.AssignmentLifecycle_ASSIGNMENT_LIFECYCLE_CANDIDATE_RECEIVED {
 		t.Fatalf("PrepareAssignment() = %+v, error = %v", prepared, err)
 	}
-	if _, err = store.ArmAssignment(ctx, "conformance-worker", "arm-1", assignment.GetAssignmentId(), assignment.GetAssignmentGeneration()); err != nil {
-		t.Fatal(err)
+	armed, err := assignmentClient.ArmAssignment(ctx, &conformancev1.ArmAssignmentRequest{Source: "conformance-validator", MessageId: "arm-1", AssignmentId: assignment.GetAssignmentId(), AssignmentGeneration: assignment.GetAssignmentGeneration()})
+	if err != nil || armed.GetAssignment().GetLifecycle() != conformancev1.AssignmentLifecycle_ASSIGNMENT_LIFECYCLE_CANDIDATE_ARMED {
+		t.Fatalf("ArmAssignment() = %+v, error = %v", armed, err)
 	}
 	cutoverAt := now.Add(-time.Second)
 	cutover, err := assignmentClient.CutoverAssignment(ctx, &conformancev1.CutoverAssignmentRequest{Source: "api", MessageId: "cutover-1", AssignmentId: assignment.GetAssignmentId(), AssignmentGeneration: assignment.GetAssignmentGeneration(), EffectiveAt: timestamppb.New(cutoverAt)})

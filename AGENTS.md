@@ -56,7 +56,9 @@ boundaries unless an accepted design change explicitly moves them:
 
 ## Current prototype limitations
 
-- Merged telemetry does not yet contain `wal_id`.
+- Agent and Relay now carry `wal_id`, but every deployment must upgrade those
+  producers before enabling this reader; rows from older deployments still
+  fail the forward-contract gate rather than falling back to sequence alone.
 - Relay currently acknowledges queue admission before durable InfluxDB flush;
   audit-grade conformance requires that acknowledged-loss gap to be closed.
 - The assignment gRPC, live telemetry evaluator worker, and Registry outbox

@@ -21,6 +21,8 @@ import (
 
 type assignmentStoreStub struct {
 	prepared           domain.Assignment
+	armedAssignmentID  string
+	armedGeneration    uint64
 	record             domain.AssignmentRecord
 	prepareDisposition postgresstore.ApplyDisposition
 	getCalls           int
@@ -36,8 +38,33 @@ func (s *assignmentStoreStub) PrepareAssignment(_ context.Context, _, _, _ strin
 	}
 	return postgresstore.ApplyResult{Disposition: disposition, Assignment: assignment}, s.err
 }
+func (s *assignmentStoreStub) ArmAssignment(_ context.Context, _, _, assignmentID string, generation uint64) (postgresstore.LifecycleResult, error) {
+	s.armedAssignmentID = assignmentID
+	s.armedGeneration = generation
+	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
+}
 func (s *assignmentStoreStub) CancelCandidate(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error) {
 	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
+}
+
+func TestArmAssignmentMapsDurableLifecycle(t *testing.T) {
+	store := &assignmentStoreStub{record: domain.AssignmentRecord{
+		Assignment: domain.Assignment{ID: "assignment-1", Generation: 7},
+		Lifecycle:  domain.AssignmentArmed,
+	}}
+	handler, err := NewAssignmentHandler(store, "standard-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := handler.ArmAssignment(context.Background(), &conformancev1.ArmAssignmentRequest{
+		Source: "conformance-validator", MessageId: "arm-1", AssignmentId: "assignment-1", AssignmentGeneration: 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.armedAssignmentID != "assignment-1" || store.armedGeneration != 7 || response.GetDisposition() != conformancev1.AssignmentCommandDisposition_ASSIGNMENT_COMMAND_DISPOSITION_APPLIED || response.GetAssignment().GetLifecycle() != conformancev1.AssignmentLifecycle_ASSIGNMENT_LIFECYCLE_CANDIDATE_ARMED {
+		t.Fatalf("store=%q/%d response=%+v", store.armedAssignmentID, store.armedGeneration, response)
+	}
 }
 func (s *assignmentStoreStub) CutoverAssignment(context.Context, string, string, string, uint64, time.Time) (postgresstore.LifecycleResult, error) {
 	return postgresstore.LifecycleResult{Disposition: postgresstore.ApplyApplied, Record: s.record}, s.err
@@ -194,6 +221,10 @@ func TestAssignmentHandlersRejectUnsupportedStorageRanges(t *testing.T) {
 			_, err := handler.CancelAssignmentCandidate(context.Background(), &conformancev1.CancelAssignmentCandidateRequest{Source: "api", MessageId: "cancel-generation", AssignmentId: "assignment-1", AssignmentGeneration: overflowGeneration})
 			return err
 		},
+		"arm generation": func() error {
+			_, err := handler.ArmAssignment(context.Background(), &conformancev1.ArmAssignmentRequest{Source: "validator", MessageId: "arm-generation", AssignmentId: "assignment-1", AssignmentGeneration: overflowGeneration})
+			return err
+		},
 		"cutover generation": func() error {
 			_, err := handler.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{Source: "api", MessageId: "cutover-generation", AssignmentId: "assignment-1", AssignmentGeneration: overflowGeneration, EffectiveAt: timestamppb.New(now)})
 			return err
@@ -223,6 +254,9 @@ func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
 	}
 	if _, err := handler.CutoverAssignment(context.Background(), &conformancev1.CutoverAssignmentRequest{}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("missing cutover timestamp error = %v", err)
+	}
+	if _, err := handler.ArmAssignment(context.Background(), &conformancev1.ArmAssignmentRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("missing arm identity error = %v", err)
 	}
 	if _, err := handler.GetAssignment(context.Background(), &conformancev1.GetAssignmentRequest{AssignmentId: "assignment-1", AssignmentGeneration: 1}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("stale assignment error = %v", err)
