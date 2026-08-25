@@ -51,7 +51,12 @@ capture time. A delayed frame received after cutover but captured before it is
 therefore evaluated against generation 7. A frame captured exactly at cutover
 belongs to generation 8. The replacement interval ends exclusively at its
 immutable `effective_until`; observations at or after that boundary have no
-assignment authority.
+assignment authority. This is a monitoring-authority boundary, not the end of
+the planned 4D authorization. Volume `ends_at` timestamps may occur earlier,
+and observations between the last authorized volume and `effective_until` are
+evaluated as temporal deviations. Mission lifecycle must leave enough
+monitoring authority for an active-aircraft overrun and explicitly end it after
+completion.
 
 Late evaluation does not revive a generation 7 lease. A worker holding the
 current generation 8 lease may call `CommitHistoricalEvaluation`; PostgreSQL
@@ -117,9 +122,10 @@ new candidate if a binary is accidentally rolled back.
 The store and external Protobuf contracts implement this lifecycle. The gRPC
 surface carries assignment ID, assignment generation, exact intent ID/version,
 stable message ID, and cutover `effective_at`; exact-generation reads support
-reconciliation after ambiguous delivery. The worker that validates and arms a
-candidate remains a later runtime slice and is intentionally not exposed as an
-API-owned command.
+reconciliation after ambiguous delivery. `ArmAssignment` exposes the durable
+Conformance-owned transition so a validation coordinator can record that its
+checks completed. It does not grant telemetry authority, and mission-lifecycle
+clients must still wait for that armed result before requesting cutover.
 
 `PrepareAssignment` validates the evaluator's executable contract before any
 candidate is persisted. It requires a supported policy, storage-compatible

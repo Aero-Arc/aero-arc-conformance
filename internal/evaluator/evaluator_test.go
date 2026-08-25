@@ -175,6 +175,26 @@ func TestVolumeWindowsAreHalfOpenAndGapsAreTemporal(t *testing.T) {
 	}
 }
 
+func TestPlannedWindowOverrunRemainsMonitoredAsTemporalDeviation(t *testing.T) {
+	plannedEnd := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})
+	a := testAssignment(plannedEnd)
+	a.EffectiveFrom = plannedEnd.Add(-time.Hour)
+	a.EffectiveUntil = plannedEnd.Add(24 * time.Hour)
+	a.Volumes[0].StartsAt = plannedEnd.Add(-time.Hour)
+	a.Volumes[0].EndsAt = plannedEnd
+
+	overrun := observation(plannedEnd.Add(30*time.Second), 1, 35.005, -97.005, 100)
+	result := mustEvaluate(t, e, overrun.ObservedAt, a, overrun, domain.EvaluatorState{})
+	temporal := result.State.Violations[domain.ViolationTemporal]
+	if result.Condition != domain.ConditionNonConforming || temporal.Phase != domain.IncidentOpen {
+		t.Fatalf("planned-window overrun result = %#v", result)
+	}
+	if result.Monitoring != domain.MonitoringCurrent {
+		t.Fatalf("monitoring = %s, want current", result.Monitoring)
+	}
+}
+
 func TestEvaluateDoesNotMutatePreviousState(t *testing.T) {
 	now := time.Now().UTC()
 	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 2, RecoverAfterSamples: 2, TelemetryFreshness: time.Minute})

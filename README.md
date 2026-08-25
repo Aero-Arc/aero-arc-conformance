@@ -10,8 +10,8 @@ and records replayable incident evidence.
 > store, and forward-contract InfluxDB reader are real and tested. The binary
 > serves assignment lifecycle gRPC, runs the fenced telemetry evaluator worker,
 > and delivers committed live projections to Registry through a leased
-> PostgreSQL outbox. Startup remains intentionally gated on Relay supplying the
-> required `wal_id` telemetry contract.
+> PostgreSQL outbox. Startup remains intentionally gated on the deployed Agent
+> and Relay supplying the required `wal_id` telemetry contract.
 
 ![Aero Arc Conformance data flow from mission assignment and telemetry through evaluation into live and durable state](docs/images/conformance-data-flow.svg)
 
@@ -28,7 +28,7 @@ interrupt Relay telemetry acknowledgement or storage.
 - Numbered PostgreSQL migrations for assignments, inbox, fenced leases,
   checkpoints, incidents, immutable transition events, summaries, and outbox.
 - Atomic assignment application and atomic fenced evaluation commits.
-- Idempotent assignment prepare/cancel/cutover gRPC plus exact-generation reads.
+- Idempotent assignment prepare/arm/cancel/cutover gRPC plus exact-generation reads.
 - Independently leased Registry outbox publication with exact evaluation acknowledgement.
 - Live claim/poll/evaluate/checkpoint orchestration with lease renewal, settle
   delay, bounded window splitting, and cancellation-aware shutdown.
@@ -41,9 +41,10 @@ interrupt Relay telemetry acknowledgement or storage.
   logging, strict YAML configuration, and bounded shutdown.
 - Real Postgres and InfluxDB integration coverage through Testcontainers.
 
-The reader deliberately fails with `ErrWALIdentityUnavailable` against today’s
-merged Relay schema, because that schema does not yet carry `wal_id`. This is a
-deployment gate, not a legacy mode that can quietly weaken replay correctness.
+The reader deliberately fails with `ErrWALIdentityUnavailable` when the
+deployed telemetry schema or a position row does not carry `wal_id`. Agent and
+Relay now implement the field, but this remains a rollout gate rather than a
+legacy mode that can quietly weaken replay correctness.
 The runtime also does not yet commit a cursor-free monitoring-only revision on
 empty or failed reads; Registry freshness currently falls back to its projection
 TTL instead of receiving an immediate `stale` or `unavailable` update.
@@ -66,7 +67,7 @@ go run ./cmd/aero-arc-conformance --config-path configs/config.yaml
 
 `go run` accepts assignment lifecycle commands, evaluates due active assignments,
 and publishes committed Registry outbox rows. The worker returns a terminal
-error instead of evaluating when Relay telemetry lacks `wal_id`.
+error instead of evaluating when deployed telemetry lacks `wal_id`.
 
 Assignment gRPC defaults to `:50052` and requires an API client certificate
 signed by the configured client CA. Management endpoints default to:

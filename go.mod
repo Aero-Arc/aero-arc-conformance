@@ -6,7 +6,7 @@ toolchain go1.24.9
 
 require (
 	github.com/InfluxCommunity/influxdb3-go/v2 v2.10.0
-	github.com/aero-arc/aero-arc-protos v0.0.0-20260815182056-d2fc8f97f2a8
+	github.com/aero-arc/aero-arc-protos v0.0.0-20260824043625-7fb48058e9d2
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/prometheus/client_golang v1.20.5
 	github.com/testcontainers/testcontainers-go v0.40.0

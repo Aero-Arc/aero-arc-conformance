@@ -24,6 +24,7 @@ import (
 // AssignmentStore is the durable lifecycle surface required by the gRPC adapter.
 type AssignmentStore interface {
 	PrepareAssignment(context.Context, string, string, string, domain.Assignment) (postgresstore.ApplyResult, error)
+	ArmAssignment(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error)
 	CancelCandidate(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error)
 	CutoverAssignment(context.Context, string, string, string, uint64, time.Time) (postgresstore.LifecycleResult, error)
 	GetAssignment(context.Context, string, uint64) (domain.AssignmentRecord, error)
@@ -90,6 +91,28 @@ func (s *AssignmentHandler) PrepareAssignment(ctx context.Context, request *conf
 	}
 	response.Assignment = assignmentRecordToProto(record)
 	return response, nil
+}
+
+// ArmAssignment records that Conformance validation completed for one received
+// candidate. Arming is a lifecycle fence only and does not grant telemetry
+// evaluation authority; CutoverAssignment remains the sole authority transfer.
+//
+// Parameters:
+//   - ctx: controls the durable lifecycle command.
+//   - request: identifies the received candidate and idempotency identity.
+//
+// Returns:
+//   - response: contains the resulting immutable armed assignment record.
+//   - error: reports validation, fencing, or store failure as a gRPC status.
+func (s *AssignmentHandler) ArmAssignment(ctx context.Context, request *conformancev1.ArmAssignmentRequest) (*conformancev1.ArmAssignmentResponse, error) {
+	if strings.TrimSpace(request.GetSource()) == "" || strings.TrimSpace(request.GetMessageId()) == "" || strings.TrimSpace(request.GetAssignmentId()) == "" || !validAssignmentGeneration(request.GetAssignmentGeneration()) {
+		return nil, status.Error(codes.InvalidArgument, "source, message_id, assignment_id, and assignment_generation are required")
+	}
+	result, err := s.store.ArmAssignment(ctx, request.GetSource(), request.GetMessageId(), request.GetAssignmentId(), request.GetAssignmentGeneration())
+	if err != nil {
+		return nil, assignmentStatusError(err)
+	}
+	return &conformancev1.ArmAssignmentResponse{Disposition: dispositionToProto(result.Disposition), Assignment: assignmentRecordToProto(result.Record)}, nil
 }
 
 // CancelAssignmentCandidate cancels only the selected received or armed
