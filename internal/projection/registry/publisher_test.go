@@ -62,6 +62,32 @@ func TestFlushAcknowledgesExactRegistryProjection(t *testing.T) {
 	}
 }
 
+func TestSummaryToProtoExposesSimultaneousCurrentOverrunFindings(t *testing.T) {
+	claim := publisherTestClaim()
+	observedAt := claim.Evaluation.ObservedAt
+	claim.Evaluation.State.Violations = map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral:  {Phase: domain.IncidentOpen, OpeningFrameID: "lateral-frame", OpenedAt: observedAt.Add(-2 * time.Second), LastObservedAt: observedAt, WorstDeviationM: 817.25},
+		domain.ViolationVertical: {Phase: domain.IncidentOpen, OpeningFrameID: "vertical-frame", OpenedAt: observedAt.Add(-time.Second), LastObservedAt: observedAt, WorstDeviationM: 10},
+		domain.ViolationTemporal: {Phase: domain.IncidentOpen, OpeningFrameID: "temporal-frame", OpenedAt: observedAt.Add(-3 * time.Second), LastObservedAt: observedAt},
+	}
+
+	summary := summaryToProto(claim)
+	if len(summary.GetViolations()) != 3 {
+		t.Fatalf("violations = %+v, want lateral+vertical+temporal", summary.GetViolations())
+	}
+	wantDeviation := map[conformancev1.ViolationType]float64{
+		conformancev1.ViolationType_VIOLATION_TYPE_LATERAL_DEVIATION:  817.25,
+		conformancev1.ViolationType_VIOLATION_TYPE_ALTITUDE_DEVIATION: 10,
+		conformancev1.ViolationType_VIOLATION_TYPE_TEMPORAL_DEVIATION: 0,
+	}
+	for _, violation := range summary.GetViolations() {
+		want, exists := wantDeviation[violation.GetViolationType()]
+		if !exists || violation.GetPhase() != conformancev1.IncidentPhase_INCIDENT_PHASE_OPEN || violation.GetLastObservedAt() == nil || !violation.GetLastObservedAt().AsTime().Equal(observedAt) || violation.GetWorstDeviationM() != want {
+			t.Fatalf("published violation = %+v", violation)
+		}
+	}
+}
+
 func TestFlushRetriesAmbiguousFailures(t *testing.T) {
 	claim := publisherTestClaim()
 	t.Run("failed precondition is not proof of a higher cursor", func(t *testing.T) {
