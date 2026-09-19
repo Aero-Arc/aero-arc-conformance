@@ -133,6 +133,26 @@ It requires one same active 4D volume to satisfy lateral and vertical bounds;
 authorization from two different volumes cannot be combined. Telemetry silence
 is assessed separately by a poll-watermark timer so historical replay cannot
 manufacture freshness incidents.
+
+While assignment authority remains active after every planned volume has ended,
+the evaluator continues spatial assessment against the unique latest-ending
+volume. This terminal-overrun reference is not authorization: temporal deviation
+remains breached, and lateral or altitude incidents may be open at the same time.
+Re-entry into that volume advances only the spatial recovery state machines;
+temporal deviation remains open until telemetry again falls within a planned
+window or mission lifecycle ends monitoring.
+
+The evaluator does not guess geometry before the first volume, inside a planned
+gap, or when multiple terminal volumes share the latest end timestamp.
+Those cases have no unambiguous spatial reference. A clear lateral or altitude
+phase is then removed from the live summary rather than carried forward as if it
+were evaluated at the current watermark. An already non-clear incident is not
+silently resolved: it remains visible with its prior `last_observed_at`, making
+the evidence gap explicit without manufacturing a recovery transition. Registry
+consumers must treat a missing spatial phase, or a retained non-clear phase whose
+`last_observed_at` predates the summary watermark, as not evaluated for that
+watermark.
+
 The evaluator exposes that assessment, but the runtime does not yet have a
 monitoring-only durable commit that can publish it without fabricating or
 regressing a telemetry cursor. Empty and failed reads therefore leave the last

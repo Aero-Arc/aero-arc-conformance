@@ -103,14 +103,18 @@ func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observ
 		evidenceByType[domain.ViolationTemporal] = evidence{known: true}
 	}
 
-	if len(activeVolumes) > 0 {
+	spatialVolumes := activeVolumes
+	if len(spatialVolumes) == 0 {
+		spatialVolumes = terminalOverrunVolumes(assignment, observation.ObservedAt)
+	}
+	if len(spatialVolumes) > 0 {
 		bestScore := math.Inf(1)
 		bestLateral, bestVertical := math.Inf(1), math.Inf(1)
 		nearestLateral := math.Inf(1)
 		anyLateralPass := false
 		compatibleVolume := false
 		jointPass := false
-		for _, volume := range activeVolumes {
+		for _, volume := range spatialVolumes {
 			lateralDistance := distanceToRingMeters(observation, volume.Polygon)
 			if lateralDistance < nearestLateral {
 				nearestLateral = lateralDistance
@@ -139,6 +143,11 @@ func (e *Evaluator) Evaluate(now time.Time, assignment domain.Assignment, observ
 			evidenceByType[domain.ViolationVertical] = evidence{known: true, breached: bestVertical > e.policy.VerticalToleranceM, deviation: bestVertical}
 		} else {
 			evidenceByType[domain.ViolationLateral] = evidence{known: true, breached: !anyLateralPass, deviation: nearestLateral}
+		}
+	}
+	for _, violation := range []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical} {
+		if signal := evidenceByType[violation]; !signal.known {
+			markNotEvaluated(cloned.Violations, violation)
 		}
 	}
 
@@ -377,6 +386,47 @@ func altitudeDeviationFromVolume(o domain.Observation, volume domain.Volume) flo
 		return o.AltitudeM - volume.AltitudeUpperM
 	}
 	return 0
+}
+
+// terminalOverrunVolumes returns the spatial reference retained after every
+// planned volume has ended but assignment authority remains active. A unique
+// latest-ending volume is deterministic; tied terminal volumes are deliberately
+// treated as ambiguous instead of unioning geometries that may represent
+// distinct branches or alternatives. Internal planned gaps never fall back to
+// an earlier volume.
+func terminalOverrunVolumes(assignment domain.Assignment, observedAt time.Time) []domain.Volume {
+	if observedAt.Before(assignment.EffectiveFrom) || !observedAt.Before(assignment.EffectiveUntil) {
+		return nil
+	}
+	latestEnd := time.Time{}
+	latestIndex := -1
+	ambiguous := false
+	for index, volume := range assignment.Volumes {
+		switch {
+		case latestEnd.IsZero() || volume.EndsAt.After(latestEnd):
+			latestEnd = volume.EndsAt
+			latestIndex = index
+			ambiguous = false
+		case volume.EndsAt.Equal(latestEnd):
+			ambiguous = true
+		}
+	}
+	if latestIndex < 0 || observedAt.Before(latestEnd) || ambiguous {
+		return nil
+	}
+	return []domain.Volume{assignment.Volumes[latestIndex]}
+}
+
+// markNotEvaluated removes only clear spatial state when the current sample has
+// no unambiguous comparison geometry or compatible altitude reference. Absence
+// from the live violation summary means not evaluated for that watermark.
+// Non-clear incidents remain unresolved and retain their last evidence cursor;
+// missing evidence must never manufacture a recovery transition.
+func markNotEvaluated(states map[domain.ViolationType]domain.IncidentState, violation domain.ViolationType) {
+	state, exists := states[violation]
+	if !exists || state.Phase == "" || state.Phase == domain.IncidentClear {
+		delete(states, violation)
+	}
 }
 
 func finite(v float64) bool            { return !math.IsNaN(v) && !math.IsInf(v, 0) }

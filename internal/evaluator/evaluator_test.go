@@ -169,13 +169,23 @@ func TestVolumeWindowsAreHalfOpenAndGapsAreTemporal(t *testing.T) {
 	a := testAssignment(now)
 	a.Volumes[0].EndsAt = now
 	a.Volumes = append(a.Volumes, domain.Volume{ID: "later", Polygon: a.Volumes[0].Polygon, AltitudeLowerM: 80, AltitudeUpperM: 120, AltitudeReference: domain.AltitudeMSL, StartsAt: now.Add(time.Second), EndsAt: now.Add(time.Hour)})
-	result := mustEvaluate(t, e, now, a, observation(now, 1, 35.005, -97.005, 100), domain.EvaluatorState{})
+	previous := domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral:  {Phase: domain.IncidentClear, LastObservedAt: now.Add(-time.Second)},
+		domain.ViolationVertical: {Phase: domain.IncidentClear, LastObservedAt: now.Add(-time.Second)},
+	}}
+	result := mustEvaluate(t, e, now, a, observation(now, 1, 35.005, -97.005, 100), previous)
 	if result.State.Violations[domain.ViolationTemporal].Phase != domain.IncidentOpen {
 		t.Fatalf("volume gap was not temporal: %#v", result)
 	}
+	if _, exists := result.State.Violations[domain.ViolationLateral]; exists {
+		t.Fatalf("gap retained stale lateral clear: %#v", result.State)
+	}
+	if _, exists := result.State.Violations[domain.ViolationVertical]; exists {
+		t.Fatalf("gap retained stale vertical clear: %#v", result.State)
+	}
 }
 
-func TestPlannedWindowOverrunRemainsMonitoredAsTemporalDeviation(t *testing.T) {
+func TestPlannedWindowOverrunEvaluatesUniqueTerminalVolume(t *testing.T) {
 	plannedEnd := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
 	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})
 	a := testAssignment(plannedEnd)
@@ -184,14 +194,126 @@ func TestPlannedWindowOverrunRemainsMonitoredAsTemporalDeviation(t *testing.T) {
 	a.Volumes[0].StartsAt = plannedEnd.Add(-time.Hour)
 	a.Volumes[0].EndsAt = plannedEnd
 
-	overrun := observation(plannedEnd.Add(30*time.Second), 1, 35.005, -97.005, 100)
-	result := mustEvaluate(t, e, overrun.ObservedAt, a, overrun, domain.EvaluatorState{})
-	temporal := result.State.Violations[domain.ViolationTemporal]
-	if result.Condition != domain.ConditionNonConforming || temporal.Phase != domain.IncidentOpen {
-		t.Fatalf("planned-window overrun result = %#v", result)
+	t.Run("inside remains spatially current while temporal is open", func(t *testing.T) {
+		overrun := observation(plannedEnd.Add(30*time.Second), 1, 35.005, -97.005, 100)
+		result := mustEvaluate(t, e, overrun.ObservedAt, a, overrun, domain.EvaluatorState{})
+		if result.Condition != domain.ConditionNonConforming || result.State.Violations[domain.ViolationTemporal].Phase != domain.IncidentOpen {
+			t.Fatalf("planned-window overrun result = %#v", result)
+		}
+		for _, violation := range []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical} {
+			state := result.State.Violations[violation]
+			if state.Phase != domain.IncidentClear || !state.LastObservedAt.Equal(overrun.ObservedAt) {
+				t.Fatalf("%s state = %#v, want current clear", violation, state)
+			}
+		}
+		if result.Monitoring != domain.MonitoringCurrent {
+			t.Fatalf("monitoring = %s, want current", result.Monitoring)
+		}
+	})
+
+	t.Run("outside opens simultaneous spatial and temporal findings", func(t *testing.T) {
+		overrun := observation(plannedEnd.Add(30*time.Second), 2, 35.02, -97.02, 130)
+		result := mustEvaluate(t, e, overrun.ObservedAt, a, overrun, domain.EvaluatorState{})
+		for _, violation := range []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical, domain.ViolationTemporal} {
+			if state := result.State.Violations[violation]; state.Phase != domain.IncidentOpen || !state.LastObservedAt.Equal(overrun.ObservedAt) {
+				t.Fatalf("%s state = %#v, want current open", violation, state)
+			}
+		}
+		if result.State.Violations[domain.ViolationLateral].WorstDeviationM <= 1 || result.State.Violations[domain.ViolationVertical].WorstDeviationM != 10 {
+			t.Fatalf("spatial deviations = lateral %.2f vertical %.2f", result.State.Violations[domain.ViolationLateral].WorstDeviationM, result.State.Violations[domain.ViolationVertical].WorstDeviationM)
+		}
+		if len(result.Transitions) != 3 {
+			t.Fatalf("transitions = %#v, want lateral+vertical+temporal opens", result.Transitions)
+		}
+	})
+}
+
+func TestOverrunSpatialIncidentsRecoverIndependentlyOfTemporal(t *testing.T) {
+	plannedEnd := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 2, RecoverAfterSamples: 2, TelemetryFreshness: time.Minute})
+	a := testAssignment(plannedEnd)
+	a.EffectiveFrom = plannedEnd.Add(-time.Hour)
+	a.EffectiveUntil = plannedEnd.Add(time.Hour)
+	a.Volumes[0].StartsAt = plannedEnd.Add(-time.Hour)
+	a.Volumes[0].EndsAt = plannedEnd
+
+	state := domain.EvaluatorState{}
+	for seq := uint64(1); seq <= 2; seq++ {
+		at := plannedEnd.Add(time.Duration(seq) * time.Second)
+		result := mustEvaluate(t, e, at, a, observation(at, seq, 35.02, -97.02, 130), state)
+		state = result.State
 	}
-	if result.Monitoring != domain.MonitoringCurrent {
-		t.Fatalf("monitoring = %s, want current", result.Monitoring)
+	if state.Violations[domain.ViolationLateral].Phase != domain.IncidentOpen || state.Violations[domain.ViolationVertical].Phase != domain.IncidentOpen || state.Violations[domain.ViolationTemporal].Phase != domain.IncidentOpen {
+		t.Fatalf("outside overrun did not open independent findings: %#v", state)
+	}
+	for seq := uint64(3); seq <= 4; seq++ {
+		at := plannedEnd.Add(time.Duration(seq) * time.Second)
+		result := mustEvaluate(t, e, at, a, observation(at, seq, 35.005, -97.005, 100), state)
+		state = result.State
+		if result.Condition != domain.ConditionNonConforming {
+			t.Fatalf("temporal finding stopped dominating during spatial recovery: %#v", result)
+		}
+	}
+	if state.Violations[domain.ViolationLateral].Phase != domain.IncidentClear || state.Violations[domain.ViolationVertical].Phase != domain.IncidentClear || state.Violations[domain.ViolationTemporal].Phase != domain.IncidentOpen {
+		t.Fatalf("reentry did not resolve only spatial findings: %#v", state)
+	}
+}
+
+func TestOverrunUsesLatestSequentialVolume(t *testing.T) {
+	plannedEnd := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})
+	a := testAssignment(plannedEnd)
+	a.EffectiveFrom = plannedEnd.Add(-time.Hour)
+	a.EffectiveUntil = plannedEnd.Add(time.Hour)
+	a.Volumes[0].StartsAt = plannedEnd.Add(-time.Hour)
+	a.Volumes[0].EndsAt = plannedEnd.Add(-30 * time.Minute)
+	a.Volumes = append(a.Volumes, domain.Volume{ID: "terminal", Polygon: shiftedPolygon(), AltitudeLowerM: 120, AltitudeUpperM: 140, AltitudeReference: domain.AltitudeMSL, StartsAt: plannedEnd.Add(-20 * time.Minute), EndsAt: plannedEnd})
+
+	overrun := observation(plannedEnd.Add(time.Second), 1, 36.005, -98.005, 130)
+	result := mustEvaluate(t, e, overrun.ObservedAt, a, overrun, domain.EvaluatorState{})
+	if result.State.Violations[domain.ViolationLateral].Phase != domain.IncidentClear || result.State.Violations[domain.ViolationVertical].Phase != domain.IncidentClear || result.State.Violations[domain.ViolationTemporal].Phase != domain.IncidentOpen {
+		t.Fatalf("overrun did not use latest sequential volume: %#v", result)
+	}
+}
+
+func TestOverrunOmitsSpatialPhasesWhenTerminalGeometryIsAmbiguous(t *testing.T) {
+	plannedEnd := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+	e := mustEvaluator(t, Policy{Version: "standard-v1", OpenAfterSamples: 1, RecoverAfterSamples: 1, TelemetryFreshness: time.Minute})
+	a := testAssignment(plannedEnd)
+	a.EffectiveFrom = plannedEnd.Add(-time.Hour)
+	a.EffectiveUntil = plannedEnd.Add(time.Hour)
+	a.Volumes[0].StartsAt = plannedEnd.Add(-time.Hour)
+	a.Volumes[0].EndsAt = plannedEnd
+	a.Volumes = append(a.Volumes, domain.Volume{ID: "alternate-terminal", Polygon: shiftedPolygon(), AltitudeLowerM: 120, AltitudeUpperM: 140, AltitudeReference: domain.AltitudeMSL, StartsAt: plannedEnd.Add(-time.Hour), EndsAt: plannedEnd})
+	previous := domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral:  {Phase: domain.IncidentClear, LastObservedAt: plannedEnd.Add(-time.Second)},
+		domain.ViolationVertical: {Phase: domain.IncidentClear, LastObservedAt: plannedEnd.Add(-time.Second)},
+	}}
+
+	overrun := observation(plannedEnd.Add(time.Second), 1, 35.005, -97.005, 100)
+	result := mustEvaluate(t, e, overrun.ObservedAt, a, overrun, previous)
+	if result.State.Violations[domain.ViolationTemporal].Phase != domain.IncidentOpen {
+		t.Fatalf("ambiguous overrun was not temporal: %#v", result)
+	}
+	for _, violation := range []domain.ViolationType{domain.ViolationLateral, domain.ViolationVertical} {
+		if _, exists := result.State.Violations[violation]; exists {
+			t.Fatalf("ambiguous overrun retained stale %s phase: %#v", violation, result.State)
+		}
+	}
+
+	openedAt := plannedEnd.Add(-time.Minute)
+	unresolved := domain.EvaluatorState{Violations: map[domain.ViolationType]domain.IncidentState{
+		domain.ViolationLateral: {Phase: domain.IncidentOpen, OpeningFrameID: "lateral-open", OpenedAt: openedAt, LastObservedAt: plannedEnd.Add(-time.Second), ConsecutiveOutside: 3, WorstDeviationM: 20},
+	}}
+	result = mustEvaluate(t, e, overrun.ObservedAt, a, overrun, unresolved)
+	lateral := result.State.Violations[domain.ViolationLateral]
+	if lateral.Phase != domain.IncidentOpen || lateral.LastObservedAt.Equal(overrun.ObservedAt) || lateral.ConsecutiveOutside != 3 || lateral.WorstDeviationM != 20 {
+		t.Fatalf("ambiguous geometry mutated unresolved incident: %#v", lateral)
+	}
+	for _, transition := range result.Transitions {
+		if transition.Violation == domain.ViolationLateral {
+			t.Fatalf("ambiguous geometry manufactured lateral transition: %#v", transition)
+		}
 	}
 }
 
@@ -240,4 +362,8 @@ func testAssignment(now time.Time) domain.Assignment {
 
 func observation(at time.Time, seq uint64, lat, lon, altitude float64) domain.Observation {
 	return domain.Observation{FrameID: "frame-" + at.Format(time.RFC3339Nano), AgentID: "agent-1", WALID: "wal-1", WALSequence: seq, AircraftID: "aircraft-1", FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 3, Latitude: lat, Longitude: lon, AltitudeM: altitude, AltitudeKnown: true, AltitudeReference: domain.AltitudeMSL, ObservedAt: at}
+}
+
+func shiftedPolygon() []domain.Point {
+	return []domain.Point{{Latitude: 36, Longitude: -98.01}, {Latitude: 36.01, Longitude: -98.01}, {Latitude: 36.01, Longitude: -98}, {Latitude: 36, Longitude: -98}}
 }

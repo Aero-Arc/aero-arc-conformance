@@ -58,6 +58,14 @@ evaluated as temporal deviations. Mission lifecycle must leave enough
 monitoring authority for an active-aircraft overrun and explicitly end it after
 completion.
 
+During a terminal planned-window overrun, Conformance retains the unique
+latest-ending volume as a spatial comparison reference until assignment
+authority ends. This permits simultaneous temporal and spatial findings without
+turning the expired volume back into authorization. Internal plan gaps never
+inherit the preceding geometry, and tied latest-ending volumes are considered
+ambiguous rather than unioned; see [Conformance design](conformance-design.md)
+for the live-summary not-evaluated contract.
+
 Late evaluation does not revive a generation 7 lease. A worker holding the
 current generation 8 lease may call `CommitHistoricalEvaluation`; PostgreSQL
 atomically consumes that current lease, verifies the observation belongs to the
