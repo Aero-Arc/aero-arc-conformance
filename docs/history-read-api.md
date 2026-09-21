@@ -13,7 +13,12 @@ refresh page one to discover late inserts. Unknown assignments produce empty rea
 
 Events expose immutable transition evidence and assignment metadata, not the
 mutable current incident summary. Spatial `deviation_m` preserves measured zero;
-temporal/telemetry-loss events omit it. No temporal deviation in seconds is inferred.
+temporal/telemetry-loss events omit it. Optional `planned_start_at` and
+`planned_end_at` come from the minimum start and maximum end of the matching
+immutable assignment generation's volume windows. Missing/incomplete windows
+omit both. These are not monitoring authority bounds, actual completion, or a
+guarantee of continuous authorization between windows. Consumers can compare the
+event observation time to these bounds; no temporal meter value is invented.
 PostgreSQL timestamp precision is retained in pagination; the event frame ID is
 available to locate original telemetry evidence.
 

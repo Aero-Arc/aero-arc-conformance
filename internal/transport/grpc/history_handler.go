@@ -72,6 +72,13 @@ func (s *AssignmentHandler) ListConformanceEvents(ctx context.Context, request *
 			kind = conformancev1.ViolationType_VIOLATION_TYPE_TELEMETRY_LOSS
 		}
 		result.Events = append(result.Events, &conformancev1.ConformanceHistoryEvent{EventId: e.ID, AssignmentId: e.AssignmentID, AssignmentGeneration: e.Generation, IntentId: e.IntentID, IntentVersion: e.IntentVersion, AircraftId: e.AircraftID, FlightId: e.FlightID, IncidentId: e.IncidentID, Transition: e.Transition, ViolationType: kind, ObservedAt: timestamppb.New(e.ObservedAt), DeviationM: e.DeviationM, FrameId: e.FrameID, EvaluationRevision: e.EvaluationRevision})
+		last := result.Events[len(result.Events)-1]
+		if e.PlannedStartAt != nil {
+			last.PlannedStartAt = timestamppb.New(*e.PlannedStartAt)
+		}
+		if e.PlannedEndAt != nil {
+			last.PlannedEndAt = timestamppb.New(*e.PlannedEndAt)
+		}
 	}
 	return result, nil
 }

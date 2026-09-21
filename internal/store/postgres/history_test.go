@@ -7,10 +7,25 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"github.com/aero-arc/aero-arc-conformance/internal/domain"
 	"math"
 	"testing"
 	"time"
 )
+
+func TestHistoryPlanBounds(t *testing.T) {
+	at := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	start, end := historyPlanBounds([]domain.Volume{{StartsAt: at.Add(time.Hour), EndsAt: at.Add(2 * time.Hour)}, {StartsAt: at, EndsAt: at.Add(time.Minute)}})
+	if start == nil || end == nil || !start.Equal(at) || !end.Equal(at.Add(2*time.Hour)) {
+		t.Fatalf("bounds=%v %v", start, end)
+	}
+	for _, volumes := range [][]domain.Volume{nil, {{StartsAt: at}}, {{StartsAt: at, EndsAt: at}}, {{StartsAt: at, EndsAt: at.Add(time.Hour)}, {}}} {
+		start, end := historyPlanBounds(volumes)
+		if start != nil || end != nil {
+			t.Fatal("fabricated bounds for incomplete plan")
+		}
+	}
+}
 
 func TestHistoryBounds(t *testing.T) {
 	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)

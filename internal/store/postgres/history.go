@@ -13,6 +13,8 @@ import (
 	"math"
 	"strings"
 	"time"
+
+	"github.com/aero-arc/aero-arc-conformance/internal/domain"
 )
 
 // ErrInvalidHistoryQuery identifies invalid filters or continuation tokens.
@@ -36,6 +38,7 @@ type HistoryEvent struct {
 	ObservedAt                                                   time.Time
 	DeviationM                                                   *float64
 	EvaluationRevision                                           uint64
+	PlannedStartAt, PlannedEndAt                                 *time.Time
 }
 
 // HistoryPage contains a bounded page and an opaque continuation token.
@@ -110,7 +113,7 @@ func (s *Store) ListConformanceEvents(ctx context.Context, query HistoryQuery) (
 	}
 	rows, err := s.pool.Query(ctx, `SELECT e.event_id,e.assignment_id,e.assignment_generation,
  a.intent_id,a.intent_version,a.aircraft_id,a.flight_id,COALESCE(e.incident_id,''),
- e.transition,e.violation_type,e.observed_at,e.deviation_m,e.frame_id,e.evaluation_revision
+ e.transition,e.violation_type,e.observed_at,e.deviation_m,e.frame_id,e.evaluation_revision,a.specification
  FROM conformance_events e JOIN conformance_assignments a USING(assignment_id,assignment_generation)
  WHERE e.assignment_id=$1 AND ($2::bigint=0 OR e.assignment_generation=$2)
  AND ($3::timestamptz IS NULL OR e.observed_at >= $3)
@@ -125,12 +128,18 @@ func (s *Store) ListConformanceEvents(ctx context.Context, query HistoryQuery) (
 	for rows.Next() {
 		var e HistoryEvent
 		var deviation float64
-		if err := rows.Scan(&e.ID, &e.AssignmentID, &e.Generation, &e.IntentID, &e.IntentVersion, &e.AircraftID, &e.FlightID, &e.IncidentID, &e.Transition, &e.ViolationType, &e.ObservedAt, &deviation, &e.FrameID, &e.EvaluationRevision); err != nil {
+		var specification []byte
+		if err := rows.Scan(&e.ID, &e.AssignmentID, &e.Generation, &e.IntentID, &e.IntentVersion, &e.AircraftID, &e.FlightID, &e.IncidentID, &e.Transition, &e.ViolationType, &e.ObservedAt, &deviation, &e.FrameID, &e.EvaluationRevision, &specification); err != nil {
 			return HistoryPage{}, fmt.Errorf("decode conformance history: %w", err)
 		}
 		if e.ViolationType == "lateral_deviation" || e.ViolationType == "altitude_deviation" {
 			e.DeviationM = &deviation
 		}
+		var assignment domain.Assignment
+		if err := json.Unmarshal(specification, &assignment); err != nil {
+			return HistoryPage{}, fmt.Errorf("decode history assignment: %w", err)
+		}
+		e.PlannedStartAt, e.PlannedEndAt = historyPlanBounds(assignment.Volumes)
 		page.Events = append(page.Events, e)
 	}
 	if err := rows.Err(); err != nil {
@@ -146,4 +155,23 @@ func (s *Store) ListConformanceEvents(ctx context.Context, query HistoryQuery) (
 		page.NextPageToken = base64.RawURLEncoding.EncodeToString(raw)
 	}
 	return page, nil
+}
+
+func historyPlanBounds(volumes []domain.Volume) (*time.Time, *time.Time) {
+	if len(volumes) == 0 {
+		return nil, nil
+	}
+	start, end := volumes[0].StartsAt, volumes[0].EndsAt
+	for _, v := range volumes {
+		if v.StartsAt.IsZero() || v.EndsAt.IsZero() || !v.StartsAt.Before(v.EndsAt) {
+			return nil, nil
+		}
+		if v.StartsAt.Before(start) {
+			start = v.StartsAt
+		}
+		if v.EndsAt.After(end) {
+			end = v.EndsAt
+		}
+	}
+	return &start, &end
 }

@@ -58,6 +58,9 @@ func TestDurableHistoryPaginationAndIsolation(t *testing.T) {
 		}
 	}
 	at := time.Date(2026, 9, 1, 0, 0, 0, 123456000, time.UTC)
+	if _, err := conn.Exec(ctx, `UPDATE conformance_assignments SET specification='{"volumes":[{"starts_at":"2026-08-31T23:00:00Z","ends_at":"2026-09-01T00:00:00Z"}]}' WHERE assignment_id='a' AND assignment_generation=2`); err != nil {
+		t.Fatal(err)
+	}
 	for _, e := range []struct {
 		id, a, kind, transition string
 		g                       int
@@ -90,6 +93,12 @@ func TestDurableHistoryPaginationAndIsolation(t *testing.T) {
 			ids = append(ids, e.ID)
 			if e.ID == "c" && e.DeviationM != nil {
 				t.Fatal("temporal event fabricated meter measurement")
+			}
+			if e.ID == "c" && (e.PlannedEndAt == nil || !e.PlannedEndAt.Equal(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))) {
+				t.Fatal("historical planned end lost")
+			}
+			if e.ID == "b" && e.PlannedEndAt != nil {
+				t.Fatal("plan bounds leaked across generations")
 			}
 			if e.ID == "b" && (e.DeviationM == nil || *e.DeviationM != 0) {
 				t.Fatal("measured zero lost")
