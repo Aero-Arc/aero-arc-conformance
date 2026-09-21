@@ -293,7 +293,7 @@ func assertFreshSchema(t *testing.T, ctx context.Context, dsn string) {
 	if err = conn.QueryRow(ctx, `SELECT count(*),max(version) FROM schema_migrations`).Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 || version != 1 {
+	if count != 2 || version != 2 {
 		t.Fatalf("fresh schema ledger count=%d version=%d", count, version)
 	}
 }
