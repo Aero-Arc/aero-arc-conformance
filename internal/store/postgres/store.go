@@ -267,9 +267,12 @@ type LifecycleResult struct {
 }
 
 type lifecycleCommand struct {
-	AssignmentID string     `json:"assignment_id"`
-	Generation   uint64     `json:"assignment_generation"`
-	EffectiveAt  *time.Time `json:"effective_at,omitempty"`
+	AssignmentID  string     `json:"assignment_id"`
+	Generation    uint64     `json:"assignment_generation"`
+	EffectiveAt   *time.Time `json:"effective_at,omitempty"`
+	FlightID      string     `json:"flight_id,omitempty"`
+	AircraftID    string     `json:"aircraft_id,omitempty"`
+	IntentVersion uint32     `json:"intent_version,omitempty"`
 }
 
 // ArmAssignment marks a prepared generation ready for cutover. It does not
