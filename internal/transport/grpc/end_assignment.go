@@ -15,7 +15,7 @@ import (
 
 // EndAssignment records monitoring closure for an exact assignment generation.
 // Generation zero resolves one active/ending generation matching the exact
-// flight, aircraft and intent version, under the assignment lifecycle lock.
+// flight, aircraft, intent identity and version, under the assignment lifecycle lock.
 // A replay of source/message identity uses the originally resolved generation;
 // changed content conflicts. Closure fences workers and preserves committed
 // evidence: the half-open authority boundary includes completion and the existing
@@ -30,19 +30,19 @@ import (
 // AlreadyExists for changed replay content, NotFound for missing authority,
 // FailedPrecondition for binding/lifecycle conflicts, or a dependency error.
 func (s *AssignmentHandler) EndAssignment(ctx context.Context, req *pb.EndAssignmentRequest) (*pb.EndAssignmentResponse, error) {
-	if strings.TrimSpace(req.GetSource()) == "" || strings.TrimSpace(req.GetMessageId()) == "" || strings.TrimSpace(req.GetAssignmentId()) == "" || strings.TrimSpace(req.GetFlightId()) == "" || strings.TrimSpace(req.GetAircraftId()) == "" || req.GetIntentVersion() == 0 || req.GetIntentVersion() > math.MaxInt32 || req.GetAssignmentGeneration() > math.MaxInt64 {
+	if strings.TrimSpace(req.GetSource()) == "" || strings.TrimSpace(req.GetMessageId()) == "" || strings.TrimSpace(req.GetAssignmentId()) == "" || strings.TrimSpace(req.GetFlightId()) == "" || strings.TrimSpace(req.GetAircraftId()) == "" || strings.TrimSpace(req.GetIntentId()) == "" || req.GetIntentVersion() == 0 || req.GetIntentVersion() > math.MaxInt32 || req.GetAssignmentGeneration() > math.MaxInt64 {
 		return nil, status.Error(codes.InvalidArgument, "valid completion identity and binding required")
 	}
 	if req.GetFlightCompletedAt() == nil || req.GetFlightCompletedAt().CheckValid() != nil || !supportedUnixNanoseconds(req.GetFlightCompletedAt().AsTime()) {
 		return nil, status.Error(codes.InvalidArgument, "valid completion time required")
 	}
 	store, ok := s.store.(interface {
-		EndAssignment(context.Context, string, string, string, uint64, string, string, uint32, time.Time) (domain.AssignmentRecord, error)
+		EndAssignment(context.Context, string, string, string, uint64, string, string, string, uint32, time.Time) (domain.AssignmentRecord, error)
 	})
 	if !ok {
 		return nil, status.Error(codes.Unimplemented, "assignment completion unavailable")
 	}
-	record, err := store.EndAssignment(ctx, req.GetSource(), req.GetMessageId(), req.GetAssignmentId(), req.GetAssignmentGeneration(), req.GetFlightId(), req.GetAircraftId(), req.GetIntentVersion(), req.GetFlightCompletedAt().AsTime())
+	record, err := store.EndAssignment(ctx, req.GetSource(), req.GetMessageId(), req.GetAssignmentId(), req.GetAssignmentGeneration(), req.GetFlightId(), req.GetAircraftId(), req.GetIntentId(), req.GetIntentVersion(), req.GetFlightCompletedAt().AsTime())
 	if err != nil {
 		return nil, assignmentStatusError(err)
 	}

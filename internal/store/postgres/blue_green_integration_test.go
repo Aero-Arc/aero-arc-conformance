@@ -8,6 +8,7 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -293,7 +294,7 @@ func assertFreshSchema(t *testing.T, ctx context.Context, dsn string) {
 	if err = conn.QueryRow(ctx, `SELECT count(*),max(version) FROM schema_migrations`).Scan(&count, &version); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 || version != 2 {
+	if count != 3 || version != 3 {
 		t.Fatalf("fresh schema ledger count=%d version=%d", count, version)
 	}
 }
@@ -523,4 +524,77 @@ func activate(t *testing.T, ctx context.Context, store *postgresstore.Store, val
 
 func assignment(now time.Time, generation uint64, intentVersion uint32) domain.Assignment {
 	return domain.Assignment{ID: "assignment-focused", Generation: generation, AircraftID: "aircraft", AgentID: "agent", FlightID: "flight", IntentID: "intent", IntentVersion: intentVersion, PolicyVersion: "standard-v1", EffectiveFrom: now.Add(-time.Hour), EffectiveUntil: now.Add(time.Hour), Volumes: []domain.Volume{{ID: "volume", Polygon: []domain.Point{{Latitude: 35, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97.01}, {Latitude: 35.01, Longitude: -97}, {Latitude: 35, Longitude: -97}}, AltitudeLowerM: 80, AltitudeUpperM: 120, AltitudeReference: domain.AltitudeMSL, StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour)}}}
+}
+
+func TestMigration003UpgradesExistingSchema(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	dsn := os.Getenv("AERO_CONFORMANCE_TEST_POSTGRES_URL")
+	if dsn == "" {
+		testcontainers.SkipIfProviderIsNotHealthy(t)
+		container, err := testsupport.StartPostgres(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dsn = container.URL
+		t.Cleanup(func() {
+			if err := container.Dependency.Shutdown(t.Failed(), os.Stderr); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = admin.Close(ctx) }()
+	schema := fmt.Sprintf("migration003_%d", time.Now().UnixNano())
+	quoted := pgx.Identifier{schema}.Sanitize()
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, "DROP SCHEMA "+quoted+" CASCADE") }()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.RuntimeParams["search_path"] = schema
+	upgradeDSN := cfg.ConnString()
+	conn, err := pgx.Connect(ctx, upgradeDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for i, name := range []string{"001_initial.sql", "002_history_read_index.sql"} {
+		raw, err := os.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = conn.Exec(ctx, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+		sum := fmt.Sprintf("%x", sha256.Sum256(raw))
+		if _, err = conn.Exec(ctx, `INSERT INTO schema_migrations(version,checksum) VALUES($1,$2)`, i+1, sum); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = conn.Exec(ctx, `INSERT INTO conformance_assignments(assignment_id,assignment_generation,aircraft_id,agent_id,flight_id,intent_id,intent_version,policy_version,lifecycle_state,specification) VALUES('preserved',1,'aircraft','agent','flight','intent',1,'policy','candidate_received','{}')`); err != nil {
+		t.Fatal(err)
+	}
+	store, err := postgresstore.Open(ctx, upgradeDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	assertFreshSchema(t, ctx, upgradeDSN)
+	var receipt *time.Time
+	if err = conn.QueryRow(ctx, `SELECT finalization_requested_at FROM conformance_assignments WHERE assignment_id='preserved'`).Scan(&receipt); err != nil || receipt != nil {
+		t.Fatalf("old assignment lost or receipt invented: %v %v", receipt, err)
+	}
+	store, err = postgresstore.Open(ctx, upgradeDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	assertFreshSchema(t, ctx, upgradeDSN)
 }

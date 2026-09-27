@@ -7,6 +7,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/aero-arc/aero-arc-conformance/internal/domain"
 	postgres "github.com/aero-arc/aero-arc-conformance/internal/store/postgres"
 	"github.com/aero-arc/aero-arc-conformance/internal/testsupport"
@@ -51,14 +52,19 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	if _, err = conn.Exec(ctx, `UPDATE conformance_assignments SET lease_owner='old-worker',lease_until=clock_timestamp()+interval '1 minute',lease_generation=10 WHERE assignment_id=$1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.EndAssignment(ctx, "api", id+"-wrong", id, 7, "wrong-flight", a.AircraftID, 2, now); !errors.Is(err, postgres.ErrInvalidTransition) {
+	if _, err = s.EndAssignment(ctx, "api", id+"-wrong", id, 7, "wrong-flight", a.AircraftID, a.IntentID, 2, now); !errors.Is(err, postgres.ErrInvalidTransition) {
 		t.Fatalf("wrong binding accepted: %v", err)
+	}
+	for _, gen := range []uint64{0, 7} {
+		if _, err = s.EndAssignment(ctx, "api", id+"-wrong-intent", id, gen, a.FlightID, a.AircraftID, "different-intent", 2, now); !errors.Is(err, postgres.ErrInvalidTransition) {
+			t.Fatalf("wrong intent accepted for generation %d: %v", gen, err)
+		}
 	}
 	watermark := now.Add(2 * time.Second)
 	if _, err = conn.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,observed_at_unix_ns,frame_id,payload) VALUES($1,7,1,'conforming','current','recorded',$2,$3,'frame','{}')`, id, watermark, watermark.UnixNano()); err != nil {
 		t.Fatal(err)
 	}
-	ended, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, 2, now)
+	ended, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, a.IntentID, 2, now)
 	if err != nil || ended.Lifecycle != domain.AssignmentEnding || ended.Assignment.Generation != 7 || !ended.AuthorityUntil.Equal(watermark.Add(time.Nanosecond)) {
 		t.Fatalf("end=%+v err=%v", ended, err)
 	}
@@ -67,14 +73,24 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	if err = conn.QueryRow(ctx, `SELECT lease_generation,lease_owner FROM conformance_assignments WHERE assignment_id=$1`, id).Scan(&generation, &owner); err != nil || generation != 11 || owner != nil {
 		t.Fatalf("lease not fenced: %d %v %v", generation, owner, err)
 	}
-	replay, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, 2, now)
+	replay, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, a.IntentID, 2, now)
 	if err != nil || !replay.AuthorityUntil.Equal(*ended.AuthorityUntil) {
 		t.Fatalf("replay=%+v %v", replay, err)
 	}
-	if _, err = s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, 2, now.Add(time.Second)); !errors.Is(err, postgres.ErrMessageConflict) {
+	if _, err = s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, a.IntentID, 2, now.Add(time.Second)); !errors.Is(err, postgres.ErrMessageConflict) {
 		t.Fatalf("changed event accepted: %v", err)
 	}
-	claims, err := s.ClaimDueAssignmentsWithFinalizationGrace(ctx, "late-tail", time.Second, 10*time.Second, 100)
+	for i := 0; i < 3; i++ {
+		active := a
+		active.ID = fmt.Sprintf("%s-backlog-%d", id, i)
+		active.AircraftID = active.ID
+		active.FlightID = active.ID
+		activateAssignment(t, ctx, s, active, active.ID, now.Add(-time.Second))
+		if _, err = conn.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=clock_timestamp()-interval '1 hour' WHERE assignment_id=$1`, active.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims, err := s.ClaimDueAssignmentsWithFinalizationGrace(ctx, "late-tail", time.Second, 10*time.Second, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

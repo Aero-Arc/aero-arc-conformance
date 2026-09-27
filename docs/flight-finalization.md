@@ -1,7 +1,7 @@
 # Monitoring closure after a flight
 
 The API submits `EndAssignment` with a stable event identity, exact flight,
-aircraft, intent version, and physical completion timestamp. Assignment generation
+aircraft, intent identity and version, and physical completion timestamp. Assignment generation
 zero resolves exactly one active/ending record with that binding. Intent version
 is never used as a substitute for assignment generation. Explicit generations
 still require the same binding check.
@@ -22,3 +22,6 @@ durable receipt. Claim, renewal, and rescheduling use that receipt timestamp;
 the event-time authority boundary remains unchanged. Duplicate deliveries do not
 extend the grace period, and observations outside the original interval remain
 inadmissible.
+
+Ending assignments are claimed before active backlog, ordered by their final-drain
+deadline, so older overdue active work cannot consume the closure grace window.

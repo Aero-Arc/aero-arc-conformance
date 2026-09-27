@@ -273,6 +273,7 @@ type lifecycleCommand struct {
 	FlightID      string     `json:"flight_id,omitempty"`
 	AircraftID    string     `json:"aircraft_id,omitempty"`
 	IntentVersion uint32     `json:"intent_version,omitempty"`
+	IntentID      string     `json:"intent_id,omitempty"`
 }
 
 // ArmAssignment marks a prepared generation ready for cutover. It does not
@@ -690,7 +691,9 @@ func (s *Store) ClaimDueAssignmentsWithFinalizationGrace(ctx context.Context, wo
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 SELECT assignment_id,assignment_generation FROM conformance_assignments
 WHERE lifecycle_state IN ('active','ending') AND GREATEST(authority_until,finalization_requested_at)+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
-ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
+ORDER BY CASE WHEN lifecycle_state='ending' THEN 0 ELSE 1 END,
+CASE WHEN lifecycle_state='ending' THEN GREATEST(authority_until,finalization_requested_at) END,
+next_evaluation_at,assignment_id,assignment_generation FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
 FROM due WHERE a.assignment_id=due.assignment_id AND a.assignment_generation=due.assignment_generation

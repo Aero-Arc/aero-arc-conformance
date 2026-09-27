@@ -271,12 +271,13 @@ func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
 }
 
 func TestEndAssignmentRejectsInvalidFieldsBeforeStore(t *testing.T) {
-	valid := &conformancev1.EndAssignmentRequest{Source: "api", MessageId: "event", AssignmentId: "intent", FlightId: "flight", AircraftId: "aircraft", IntentVersion: 1, FlightCompletedAt: timestamppb.Now()}
+	valid := &conformancev1.EndAssignmentRequest{Source: "api", MessageId: "event", AssignmentId: "intent", FlightId: "flight", AircraftId: "aircraft", IntentId: "intent", IntentVersion: 1, FlightCompletedAt: timestamppb.Now()}
 	tests := map[string]func(*conformancev1.EndAssignmentRequest){
 		"source":     func(r *conformancev1.EndAssignmentRequest) { r.Source = " " },
 		"message":    func(r *conformancev1.EndAssignmentRequest) { r.MessageId = "" },
 		"assignment": func(r *conformancev1.EndAssignmentRequest) { r.AssignmentId = "" },
 		"flight":     func(r *conformancev1.EndAssignmentRequest) { r.FlightId = "" },
+		"intent":     func(r *conformancev1.EndAssignmentRequest) { r.IntentId = "" },
 		"aircraft":   func(r *conformancev1.EndAssignmentRequest) { r.AircraftId = "" },
 		"version":    func(r *conformancev1.EndAssignmentRequest) { r.IntentVersion = 0 },
 		"generation": func(r *conformancev1.EndAssignmentRequest) { r.AssignmentGeneration = math.MaxUint64 },
