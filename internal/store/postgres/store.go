@@ -689,7 +689,7 @@ func (s *Store) ClaimDueAssignmentsWithFinalizationGrace(ctx context.Context, wo
 	}
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 SELECT assignment_id,assignment_generation FROM conformance_assignments
-WHERE lifecycle_state IN ('active','ending') AND authority_until+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
+WHERE lifecycle_state IN ('active','ending') AND GREATEST(authority_until,finalization_requested_at)+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
 ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
@@ -737,7 +737,7 @@ func (s *Store) DeferAssignmentEvaluation(ctx context.Context, claim Claim, next
 	if nextEvaluationAt.IsZero() {
 		return fmt.Errorf("next evaluation time is required")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND authority_until+$7::interval>=now() AND lifecycle_state IN ('active','ending')`, nextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, claim.FinalizationGrace.String())
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND GREATEST(authority_until,finalization_requested_at)+$7::interval>=now() AND lifecycle_state IN ('active','ending')`, nextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, claim.FinalizationGrace.String())
 	if err != nil {
 		return fmt.Errorf("defer assignment evaluation: %w", err)
 	}
@@ -762,7 +762,7 @@ func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND authority_until+$6::interval>=now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.FinalizationGrace.String())
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND GREATEST(authority_until,finalization_requested_at)+$6::interval>=now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.FinalizationGrace.String())
 	if err != nil {
 		return fmt.Errorf("renew assignment lease: %w", err)
 	}

@@ -74,4 +74,24 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	if _, err = s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, 2, now.Add(time.Second)); !errors.Is(err, postgres.ErrMessageConflict) {
 		t.Fatalf("changed event accepted: %v", err)
 	}
+	claims, err := s.ClaimDueAssignmentsWithFinalizationGrace(ctx, "late-tail", time.Second, 10*time.Second, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tail *postgres.Claim
+	for i := range claims {
+		if claims[i].Assignment.ID == id {
+			tail = &claims[i]
+		}
+	}
+	if tail == nil {
+		t.Fatal("late completion stranded the final telemetry drain")
+	}
+	if !tail.AuthorityUntil.Equal(*ended.AuthorityUntil) {
+		t.Fatal("claim extended event-time authority")
+	}
+	if err = s.RenewAssignmentLease(ctx, *tail, time.Second); err != nil {
+		t.Fatalf("late final claim cannot renew: %v", err)
+	}
+
 }

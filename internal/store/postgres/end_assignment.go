@@ -99,7 +99,7 @@ func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignment
 		boundaryNS = min(boundaryNS, record.AuthorityUntil.UnixNano())
 	}
 	boundary := time.Unix(0, boundaryNS).UTC()
-	if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='ending',authority_until=$3,authority_until_unix_ns=$4,lease_owner=NULL,lease_until=NULL,lease_generation=lease_generation+1,next_evaluation_at=now(),updated_at=now() WHERE assignment_id=$1 AND assignment_generation=$2`, assignmentID, generation, boundary, boundaryNS); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE conformance_assignments SET lifecycle_state='ending',finalization_requested_at=COALESCE(finalization_requested_at,clock_timestamp()),authority_until=$3,authority_until_unix_ns=$4,lease_owner=NULL,lease_until=NULL,lease_generation=lease_generation+1,next_evaluation_at=now(),updated_at=now() WHERE assignment_id=$1 AND assignment_generation=$2`, assignmentID, generation, boundary, boundaryNS); err != nil {
 		return record, err
 	}
 	if err = recordLifecycleCommand(ctx, tx, source, messageID, "assignment_ending", assignmentID, generation, string(record.Lifecycle), "ending", &boundary, payload, hash); err != nil {

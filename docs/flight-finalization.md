@@ -16,3 +16,9 @@ The existing ending-worker rules can evaluate a bounded tail. This does not prov
 that every delayed telemetry frame has arrived. Archival completeness and later
 revisions require a separate ingestion/watermark policy; monitoring closure alone
 must not be advertised as a complete evidence archive.
+
+Late completion delivery starts a bounded final-drain grace period at its first
+durable receipt. Claim, renewal, and rescheduling use that receipt timestamp;
+the event-time authority boundary remains unchanged. Duplicate deliveries do not
+extend the grace period, and observations outside the original interval remain
+inadmissible.
