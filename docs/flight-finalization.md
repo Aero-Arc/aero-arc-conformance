@@ -1,7 +1,7 @@
 # Monitoring closure after a flight
 
 The API submits `EndAssignment` with a stable event identity, exact flight,
-aircraft, intent identity and version, and physical completion timestamp. Assignment generation
+aircraft, originating Agent, intent identity and version, and physical completion timestamp. Assignment generation
 zero resolves exactly one active/ending record with that binding. Intent version
 is never used as a substitute for assignment generation. Explicit generations
 still require the same binding check.

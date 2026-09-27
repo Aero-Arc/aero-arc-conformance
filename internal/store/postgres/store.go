@@ -274,6 +274,7 @@ type lifecycleCommand struct {
 	AircraftID    string     `json:"aircraft_id,omitempty"`
 	IntentVersion uint32     `json:"intent_version,omitempty"`
 	IntentID      string     `json:"intent_id,omitempty"`
+	AgentID       string     `json:"agent_id,omitempty"`
 }
 
 // ArmAssignment marks a prepared generation ready for cutover. It does not

@@ -22,7 +22,7 @@ import (
 //   - assignmentID, generation: select authority. Zero resolves exactly one active
 //     or ending generation matching every binding field; replay uses the original
 //     inbox generation even if that generation is no longer active.
-//   - flightID, aircraftID, intentID, intentVersion: must all match that assignment.
+//   - flightID, aircraftID, intentID, agentID, intentVersion: must all match that assignment.
 //   - completedAt: aircraft event time within the active interval and not future.
 //
 // Returns: the ending record after commit, retaining already committed evidence
@@ -33,12 +33,12 @@ import (
 // outside active authority. ErrNotFound reports missing explicit authority. Invalid
 // arguments, encoding, and storage failures are returned without a partial commit.
 // Ending permits a bounded final telemetry drain; it does not prove archive coverage.
-func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64, flightID, aircraftID, intentID string, intentVersion uint32, completedAt time.Time) (domain.AssignmentRecord, error) {
-	if source == "" || messageID == "" || assignmentID == "" || flightID == "" || aircraftID == "" || intentID == "" || intentVersion == 0 || generation > math.MaxInt64 || !supportedUnixNanoseconds(completedAt) {
+func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64, flightID, aircraftID, intentID, agentID string, intentVersion uint32, completedAt time.Time) (domain.AssignmentRecord, error) {
+	if source == "" || messageID == "" || assignmentID == "" || flightID == "" || aircraftID == "" || intentID == "" || agentID == "" || intentVersion == 0 || generation > math.MaxInt64 || !supportedUnixNanoseconds(completedAt) {
 		return domain.AssignmentRecord{}, fmt.Errorf("invalid end assignment command")
 	}
 	completedAt = completedAt.UTC()
-	payload, hash, err := encodeCommand("assignment_ending", lifecycleCommand{AssignmentID: assignmentID, Generation: generation, EffectiveAt: &completedAt, FlightID: flightID, AircraftID: aircraftID, IntentID: intentID, IntentVersion: intentVersion})
+	payload, hash, err := encodeCommand("assignment_ending", lifecycleCommand{AssignmentID: assignmentID, Generation: generation, EffectiveAt: &completedAt, FlightID: flightID, AircraftID: aircraftID, IntentID: intentID, AgentID: agentID, IntentVersion: intentVersion})
 	if err != nil {
 		return domain.AssignmentRecord{}, err
 	}
@@ -63,7 +63,7 @@ func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignment
 		}
 	}
 	if generation == 0 {
-		rows, queryErr := tx.Query(ctx, `SELECT assignment_generation FROM conformance_assignments WHERE assignment_id=$1 AND flight_id=$2 AND aircraft_id=$3 AND intent_version=$4 AND intent_id=$5 AND lifecycle_state IN ('active','ending') ORDER BY assignment_generation LIMIT 2`, assignmentID, flightID, aircraftID, intentVersion, intentID)
+		rows, queryErr := tx.Query(ctx, `SELECT assignment_generation FROM conformance_assignments WHERE assignment_id=$1 AND flight_id=$2 AND aircraft_id=$3 AND intent_version=$4 AND intent_id=$5 AND agent_id=$6 AND lifecycle_state IN ('active','ending') ORDER BY assignment_generation LIMIT 2`, assignmentID, flightID, aircraftID, intentVersion, intentID, agentID)
 		if queryErr != nil {
 			return domain.AssignmentRecord{}, queryErr
 		}
@@ -88,7 +88,7 @@ func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignment
 	if err != nil {
 		return record, err
 	}
-	if record.Assignment.FlightID != flightID || record.Assignment.AircraftID != aircraftID || record.Assignment.IntentVersion != intentVersion || record.Assignment.IntentID != intentID {
+	if record.Assignment.FlightID != flightID || record.Assignment.AircraftID != aircraftID || record.Assignment.IntentVersion != intentVersion || record.Assignment.IntentID != intentID || record.Assignment.AgentID != agentID {
 		return record, fmt.Errorf("%w: completion flight binding mismatch", ErrInvalidTransition)
 	}
 	if found {
