@@ -8,14 +8,32 @@ import (
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"math"
+	"strings"
 	"time"
 )
 
 // EndAssignment records monitoring closure for an exact assignment generation.
-// Parameters: ctx bounds persistence; req supplies stable identity and aircraft
-// completion time. Returns: the durable authority boundary or a gRPC error.
+// Generation zero resolves one active/ending generation matching the exact
+// flight, aircraft and intent version, under the assignment lifecycle lock.
+// A replay of source/message identity uses the originally resolved generation;
+// changed content conflicts. Closure fences workers and preserves committed
+// evidence: the half-open authority boundary includes completion and the existing
+// watermark, without extending a previously established authority end.
+//
+// Parameters:
+//   - ctx bounds database persistence and cancellation.
+//   - req supplies immutable source/message identity, exact flight binding,
+//     optional explicit generation, and aircraft event time of completion.
+//
+// Returns: the durable ending record; InvalidArgument for malformed fields,
+// AlreadyExists for changed replay content, NotFound for missing authority,
+// FailedPrecondition for binding/lifecycle conflicts, or a dependency error.
 func (s *AssignmentHandler) EndAssignment(ctx context.Context, req *pb.EndAssignmentRequest) (*pb.EndAssignmentResponse, error) {
-	if req.GetFlightCompletedAt() == nil || req.GetFlightCompletedAt().CheckValid() != nil {
+	if strings.TrimSpace(req.GetSource()) == "" || strings.TrimSpace(req.GetMessageId()) == "" || strings.TrimSpace(req.GetAssignmentId()) == "" || strings.TrimSpace(req.GetFlightId()) == "" || strings.TrimSpace(req.GetAircraftId()) == "" || req.GetIntentVersion() == 0 || req.GetIntentVersion() > math.MaxInt32 || req.GetAssignmentGeneration() > math.MaxInt64 {
+		return nil, status.Error(codes.InvalidArgument, "valid completion identity and binding required")
+	}
+	if req.GetFlightCompletedAt() == nil || req.GetFlightCompletedAt().CheckValid() != nil || !supportedUnixNanoseconds(req.GetFlightCompletedAt().AsTime()) {
 		return nil, status.Error(codes.InvalidArgument, "valid completion time required")
 	}
 	store, ok := s.store.(interface {
