@@ -267,9 +267,14 @@ type LifecycleResult struct {
 }
 
 type lifecycleCommand struct {
-	AssignmentID string     `json:"assignment_id"`
-	Generation   uint64     `json:"assignment_generation"`
-	EffectiveAt  *time.Time `json:"effective_at,omitempty"`
+	AssignmentID  string     `json:"assignment_id"`
+	Generation    uint64     `json:"assignment_generation"`
+	EffectiveAt   *time.Time `json:"effective_at,omitempty"`
+	FlightID      string     `json:"flight_id,omitempty"`
+	AircraftID    string     `json:"aircraft_id,omitempty"`
+	IntentVersion uint32     `json:"intent_version,omitempty"`
+	IntentID      string     `json:"intent_id,omitempty"`
+	AgentID       string     `json:"agent_id,omitempty"`
 }
 
 // ArmAssignment marks a prepared generation ready for cutover. It does not
@@ -376,7 +381,7 @@ func (s *Store) transitionCandidate(ctx context.Context, source, messageID, mess
 	return LifecycleResult{Disposition: ApplyApplied, Record: record}, nil
 }
 
-// CutoverAssignment atomically closes the current generation's authority
+// CutoverAssignment rejects reopening an ending assignment and atomically closes the current generation's authority
 // interval and activates an armed candidate at effectiveAt. effectiveAt is an
 // event-time boundary; late observations before it continue to resolve to the
 // superseded generation.
@@ -457,6 +462,9 @@ func (s *Store) CutoverAssignment(ctx context.Context, source, messageID, assign
 		return LifecycleResult{}, err
 	}
 	if err == nil {
+		if currentLifecycle == string(domain.AssignmentEnding) {
+			return LifecycleResult{}, fmt.Errorf("%w: completed assignment authority cannot be reopened", ErrInvalidTransition)
+		}
 		// Read the watermark in a separate READ COMMITTED statement after the
 		// assignment lock. If an evaluation commit won the lock first, this fresh
 		// snapshot must observe the summary committed in that same transaction.
@@ -686,8 +694,10 @@ func (s *Store) ClaimDueAssignmentsWithFinalizationGrace(ctx context.Context, wo
 	}
 	rows, err := s.pool.Query(ctx, `WITH due AS (
 SELECT assignment_id,assignment_generation FROM conformance_assignments
-WHERE lifecycle_state IN ('active','ending') AND authority_until+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
-ORDER BY next_evaluation_at FOR UPDATE SKIP LOCKED LIMIT $1
+WHERE lifecycle_state IN ('active','ending') AND GREATEST(authority_until,finalization_requested_at)+$4::interval>=now() AND next_evaluation_at <= now() AND (lease_until IS NULL OR lease_until < now())
+ORDER BY CASE WHEN lifecycle_state='ending' THEN 0 ELSE 1 END,
+CASE WHEN lifecycle_state='ending' THEN GREATEST(authority_until,finalization_requested_at) END,
+next_evaluation_at,assignment_id,assignment_generation FOR UPDATE SKIP LOCKED LIMIT $1
 ), claimed AS (
 UPDATE conformance_assignments a SET lease_owner=$2, lease_generation=a.lease_generation+1, lease_until=now()+$3::interval, updated_at=now()
 FROM due WHERE a.assignment_id=due.assignment_id AND a.assignment_generation=due.assignment_generation
@@ -734,7 +744,7 @@ func (s *Store) DeferAssignmentEvaluation(ctx context.Context, claim Claim, next
 	if nextEvaluationAt.IsZero() {
 		return fmt.Errorf("next evaluation time is required")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND authority_until+$7::interval>=now() AND lifecycle_state IN ('active','ending')`, nextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, claim.FinalizationGrace.String())
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET next_evaluation_at=$1,lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND evaluation_revision=$6 AND lease_until>now() AND GREATEST(authority_until,finalization_requested_at)+$7::interval>=now() AND lifecycle_state IN ('active','ending')`, nextEvaluationAt, claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.EvaluationRevision, claim.FinalizationGrace.String())
 	if err != nil {
 		return fmt.Errorf("defer assignment evaluation: %w", err)
 	}
@@ -759,7 +769,7 @@ func (s *Store) RenewAssignmentLease(ctx context.Context, claim Claim, extension
 	if extension <= 0 {
 		return fmt.Errorf("lease extension must be positive")
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND authority_until+$6::interval>=now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.FinalizationGrace.String())
+	tag, err := s.pool.Exec(ctx, `UPDATE conformance_assignments SET lease_until=now()+$1::interval,updated_at=now() WHERE assignment_id=$2 AND assignment_generation=$3 AND lease_owner=$4 AND lease_generation=$5 AND lease_until>now() AND GREATEST(authority_until,finalization_requested_at)+$6::interval>=now() AND lifecycle_state IN ('active','ending')`, extension.String(), claim.Assignment.ID, claim.Assignment.Generation, claim.WorkerID, claim.LeaseGeneration, claim.FinalizationGrace.String())
 	if err != nil {
 		return fmt.Errorf("renew assignment lease: %w", err)
 	}

@@ -23,6 +23,7 @@ import (
 
 // AssignmentStore is the durable lifecycle surface required by the gRPC adapter.
 type AssignmentStore interface {
+	EndAssignment(context.Context, string, string, string, uint64, string, string, string, string, uint32, time.Time) (domain.AssignmentRecord, error)
 	PrepareAssignment(context.Context, string, string, string, domain.Assignment) (postgresstore.ApplyResult, error)
 	ArmAssignment(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error)
 	CancelCandidate(context.Context, string, string, string, uint64) (postgresstore.LifecycleResult, error)

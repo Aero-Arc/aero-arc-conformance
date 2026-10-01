@@ -269,3 +269,35 @@ func TestAssignmentHandlersValidateAndMapFences(t *testing.T) {
 		t.Fatalf("missing assignment error = %v", err)
 	}
 }
+
+func TestEndAssignmentRejectsInvalidFieldsBeforeStore(t *testing.T) {
+	valid := &conformancev1.EndAssignmentRequest{Source: "api", MessageId: "event", AssignmentId: "intent", FlightId: "flight", AircraftId: "aircraft", IntentId: "intent", AgentId: "agent", IntentVersion: 1, FlightCompletedAt: timestamppb.Now()}
+	tests := map[string]func(*conformancev1.EndAssignmentRequest){
+		"source":     func(r *conformancev1.EndAssignmentRequest) { r.Source = " " },
+		"message":    func(r *conformancev1.EndAssignmentRequest) { r.MessageId = "" },
+		"assignment": func(r *conformancev1.EndAssignmentRequest) { r.AssignmentId = "" },
+		"flight":     func(r *conformancev1.EndAssignmentRequest) { r.FlightId = "" },
+		"agent":      func(r *conformancev1.EndAssignmentRequest) { r.AgentId = "" },
+		"intent":     func(r *conformancev1.EndAssignmentRequest) { r.IntentId = "" },
+		"aircraft":   func(r *conformancev1.EndAssignmentRequest) { r.AircraftId = "" },
+		"version":    func(r *conformancev1.EndAssignmentRequest) { r.IntentVersion = 0 },
+		"generation": func(r *conformancev1.EndAssignmentRequest) { r.AssignmentGeneration = math.MaxUint64 },
+		"time": func(r *conformancev1.EndAssignmentRequest) {
+			r.FlightCompletedAt = timestamppb.New(time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))
+		},
+	}
+	handler := &AssignmentHandler{}
+	for name, change := range tests {
+		t.Run(name, func(t *testing.T) {
+			r := proto.Clone(valid).(*conformancev1.EndAssignmentRequest)
+			change(r)
+			if _, err := handler.EndAssignment(context.Background(), r); status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func (s *assignmentStoreStub) EndAssignment(context.Context, string, string, string, uint64, string, string, string, string, uint32, time.Time) (domain.AssignmentRecord, error) {
+	return s.record, s.err
+}
