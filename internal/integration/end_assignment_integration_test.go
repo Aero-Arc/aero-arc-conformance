@@ -84,6 +84,14 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	if _, err = conn.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,observed_at_unix_ns,frame_id,payload) VALUES($1,7,1,'conforming','current','recorded',$2,$3,'frame','{}')`, id, watermark, watermark.UnixNano()); err != nil {
 		t.Fatal(err)
 	}
+	candidate := a
+	candidate.Generation = 8
+	if _, err = s.PrepareAssignment(ctx, "api", id+"-candidate", "assignment_prepared", candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ArmAssignment(ctx, "api", id+"-candidate-arm", id, 8); err != nil {
+		t.Fatal(err)
+	}
 	ended, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, now)
 	if err != nil || ended.Lifecycle != domain.AssignmentEnding || ended.Assignment.Generation != 7 || !ended.AuthorityUntil.Equal(watermark.Add(time.Nanosecond)) {
 		t.Fatalf("end=%+v err=%v", ended, err)
@@ -91,9 +99,12 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	if _, err = s.EndAssignment(ctx, "api", id+"-second-end", id, 7, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, now.Add(-time.Millisecond)); !errors.Is(err, postgres.ErrInvalidTransition) {
 		t.Fatalf("second closure changed ending authority: %v", err)
 	}
+	if _, err = s.CutoverAssignment(ctx, "api", id+"-delayed-cutover", id, 8, now); !errors.Is(err, postgres.ErrInvalidTransition) {
+		t.Fatalf("cutover reopened completion: %v", err)
+	}
 	var generation int64
 	var owner *string
-	if err = conn.QueryRow(ctx, `SELECT lease_generation,lease_owner FROM conformance_assignments WHERE assignment_id=$1`, id).Scan(&generation, &owner); err != nil || generation != 11 || owner != nil {
+	if err = conn.QueryRow(ctx, `SELECT lease_generation,lease_owner FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=7`, id).Scan(&generation, &owner); err != nil || generation != 11 || owner != nil {
 		t.Fatalf("lease not fenced: %d %v %v", generation, owner, err)
 	}
 	replay, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, now)

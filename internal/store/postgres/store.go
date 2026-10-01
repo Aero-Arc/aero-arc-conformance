@@ -381,7 +381,7 @@ func (s *Store) transitionCandidate(ctx context.Context, source, messageID, mess
 	return LifecycleResult{Disposition: ApplyApplied, Record: record}, nil
 }
 
-// CutoverAssignment atomically closes the current generation's authority
+// CutoverAssignment rejects reopening an ending assignment and atomically closes the current generation's authority
 // interval and activates an armed candidate at effectiveAt. effectiveAt is an
 // event-time boundary; late observations before it continue to resolve to the
 // superseded generation.
@@ -462,6 +462,9 @@ func (s *Store) CutoverAssignment(ctx context.Context, source, messageID, assign
 		return LifecycleResult{}, err
 	}
 	if err == nil {
+		if currentLifecycle == string(domain.AssignmentEnding) {
+			return LifecycleResult{}, fmt.Errorf("%w: completed assignment authority cannot be reopened", ErrInvalidTransition)
+		}
 		// Read the watermark in a separate READ COMMITTED statement after the
 		// assignment lock. If an evaluation commit won the lock first, this fresh
 		// snapshot must observe the summary committed in that same transaction.
