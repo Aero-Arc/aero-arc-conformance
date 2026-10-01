@@ -297,3 +297,7 @@ func TestEndAssignmentRejectsInvalidFieldsBeforeStore(t *testing.T) {
 		})
 	}
 }
+
+func (s *assignmentStoreStub) EndAssignment(context.Context, string, string, string, uint64, string, string, string, string, uint32, time.Time) (domain.AssignmentRecord, error) {
+	return s.record, s.err
+}

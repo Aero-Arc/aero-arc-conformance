@@ -170,12 +170,16 @@ func TestRealDependenciesEvaluatePersistAndReclaim(t *testing.T) {
 	workerNow := time.Now().UTC().Add(-3 * time.Second)
 	workerAssignment := assignment
 	workerAssignment.ID = "assignment-runtime-worker"
+	// Keep earlier out-of-volume samples out of this independent runtime case,
+	// even when the preceding checks finish inside its three-second lookback.
+	workerAssignment.AircraftID = "aircraft-runtime-worker"
+	workerAssignment.Volumes = append([]domain.Volume(nil), assignment.Volumes...)
 	workerAssignment.EffectiveFrom = workerNow
 	workerAssignment.EffectiveUntil = workerNow.Add(time.Hour)
 	workerAssignment.Volumes[0].StartsAt = workerNow
 	workerAssignment.Volumes[0].EndsAt = workerNow.Add(time.Hour)
 	activateAssignment(t, ctx, store, workerAssignment, "runtime-worker", workerNow)
-	workerPoint := positionPoint(workerNow.Add(time.Second), "runtime-frame-1", 100, 35.005, -97.005, 100)
+	workerPoint := positionPoint(workerNow.Add(time.Second), "runtime-frame-1", 100, 35.005, -97.005, 100).SetField("aircraft_id", workerAssignment.AircraftID)
 	if err = client.WritePoints(ctx, []*influxdb3.Point{workerPoint}); err != nil {
 		t.Fatal(err)
 	}

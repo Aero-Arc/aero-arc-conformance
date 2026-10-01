@@ -30,7 +30,7 @@ import (
 // the lease and increments its generation, invalidating previously claimed workers.
 // ErrMessageConflict reports changed replay content; ErrInvalidTransition reports
 // ambiguous generation resolution, binding mismatch, terminal lifecycle, or time
-// outside active authority. ErrNotFound reports missing explicit authority. Invalid
+// outside active authority. ErrAssignmentNotFound reports missing explicit authority. Invalid
 // arguments, encoding, and storage failures are returned without a partial commit.
 // Ending permits a bounded final telemetry drain; it does not prove archive coverage.
 func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignmentID string, generation uint64, flightID, aircraftID, intentID, agentID string, intentVersion uint32, completedAt time.Time) (domain.AssignmentRecord, error) {
@@ -84,6 +84,13 @@ func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignment
 			return domain.AssignmentRecord{}, fmt.Errorf("%w: exact flight binding must resolve one monitoring generation", ErrInvalidTransition)
 		}
 	}
+	var exists bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conformance_assignments WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, generation).Scan(&exists); err != nil {
+		return domain.AssignmentRecord{}, err
+	}
+	if !exists {
+		return domain.AssignmentRecord{}, ErrAssignmentNotFound
+	}
 	record, err := readAssignmentRecord(ctx, tx, assignmentID, generation)
 	if err != nil {
 		return record, err
@@ -94,21 +101,24 @@ func (s *Store) EndAssignment(ctx context.Context, source, messageID, assignment
 	if found {
 		return record, tx.Commit(ctx)
 	}
-	if record.Lifecycle != domain.AssignmentActive && record.Lifecycle != domain.AssignmentEnding {
+	if record.Lifecycle != domain.AssignmentActive {
 		return record, ErrInvalidTransition
 	}
 	var now time.Time
 	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return record, err
 	}
-	if completedAt.After(now) || record.AuthorityFrom == nil || completedAt.Before(*record.AuthorityFrom) {
+	if completedAt.After(now) || record.AuthorityFrom == nil || completedAt.Before(*record.AuthorityFrom) || (record.AuthorityUntil != nil && !completedAt.Before(*record.AuthorityUntil)) {
 		return record, fmt.Errorf("%w: completion outside active flight time", ErrInvalidTransition)
 	}
-	var watermark int64
-	if err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2),0)`, assignmentID, generation).Scan(&watermark); err != nil {
+	var watermark *int64
+	if err = tx.QueryRow(ctx, `SELECT (SELECT observed_at_unix_ns FROM conformance_summaries WHERE assignment_id=$1 AND assignment_generation=$2)`, assignmentID, generation).Scan(&watermark); err != nil {
 		return record, err
 	}
-	boundaryNS := max(completedAt.UnixNano()+1, watermark+1)
+	boundaryNS := completedAt.UnixNano() + 1
+	if watermark != nil {
+		boundaryNS = max(boundaryNS, *watermark+1)
+	}
 	if record.AuthorityUntil != nil {
 		boundaryNS = min(boundaryNS, record.AuthorityUntil.UnixNano())
 	}

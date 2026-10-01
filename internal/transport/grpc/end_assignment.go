@@ -4,13 +4,11 @@ package grpc
 
 import (
 	"context"
-	"github.com/aero-arc/aero-arc-conformance/internal/domain"
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/conformance/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"math"
 	"strings"
-	"time"
 )
 
 // EndAssignment records monitoring closure for an exact assignment generation.
@@ -36,13 +34,7 @@ func (s *AssignmentHandler) EndAssignment(ctx context.Context, req *pb.EndAssign
 	if req.GetFlightCompletedAt() == nil || req.GetFlightCompletedAt().CheckValid() != nil || !supportedUnixNanoseconds(req.GetFlightCompletedAt().AsTime()) {
 		return nil, status.Error(codes.InvalidArgument, "valid completion time required")
 	}
-	store, ok := s.store.(interface {
-		EndAssignment(context.Context, string, string, string, uint64, string, string, string, string, uint32, time.Time) (domain.AssignmentRecord, error)
-	})
-	if !ok {
-		return nil, status.Error(codes.Unimplemented, "assignment completion unavailable")
-	}
-	record, err := store.EndAssignment(ctx, req.GetSource(), req.GetMessageId(), req.GetAssignmentId(), req.GetAssignmentGeneration(), req.GetFlightId(), req.GetAircraftId(), req.GetIntentId(), req.GetAgentId(), req.GetIntentVersion(), req.GetFlightCompletedAt().AsTime())
+	record, err := s.store.EndAssignment(ctx, req.GetSource(), req.GetMessageId(), req.GetAssignmentId(), req.GetAssignmentGeneration(), req.GetFlightId(), req.GetAircraftId(), req.GetIntentId(), req.GetAgentId(), req.GetIntentVersion(), req.GetFlightCompletedAt().AsTime())
 	if err != nil {
 		return nil, assignmentStatusError(err)
 	}

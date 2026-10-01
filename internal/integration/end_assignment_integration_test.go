@@ -65,6 +65,21 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 			t.Fatalf("wrong Agent accepted for generation %d: %v", gen, err)
 		}
 	}
+	if _, err = s.EndAssignment(ctx, "api", id+"-absent", id, 999, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, now); !errors.Is(err, postgres.ErrAssignmentNotFound) {
+		t.Fatalf("absent generation: %v", err)
+	}
+	// Use a past upper bound so the upper-bound check is independent of future-time rejection.
+	if _, err = conn.Exec(ctx, `UPDATE conformance_assignments SET authority_until=$2,authority_until_unix_ns=$3 WHERE assignment_id=$1`, id, now.Add(time.Second), now.Add(time.Second).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []time.Time{now.Add(time.Second), now.Add(2 * time.Second)} {
+		if _, err = s.EndAssignment(ctx, "api", id+"-outside", id, 7, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, at); !errors.Is(err, postgres.ErrInvalidTransition) {
+			t.Fatalf("completion at/after end: %v", err)
+		}
+	}
+	if _, err = conn.Exec(ctx, `UPDATE conformance_assignments SET authority_until=$2,authority_until_unix_ns=$3 WHERE assignment_id=$1`, id, a.EffectiveUntil, a.EffectiveUntil.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
 	watermark := now.Add(2 * time.Second)
 	if _, err = conn.Exec(ctx, `INSERT INTO conformance_summaries(assignment_id,assignment_generation,evaluation_revision,condition,monitoring_status,recording_status,observed_at,observed_at_unix_ns,frame_id,payload) VALUES($1,7,1,'conforming','current','recorded',$2,$3,'frame','{}')`, id, watermark, watermark.UnixNano()); err != nil {
 		t.Fatal(err)
@@ -72,6 +87,9 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	ended, err := s.EndAssignment(ctx, "api", id+"-end", id, 0, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, now)
 	if err != nil || ended.Lifecycle != domain.AssignmentEnding || ended.Assignment.Generation != 7 || !ended.AuthorityUntil.Equal(watermark.Add(time.Nanosecond)) {
 		t.Fatalf("end=%+v err=%v", ended, err)
+	}
+	if _, err = s.EndAssignment(ctx, "api", id+"-second-end", id, 7, a.FlightID, a.AircraftID, a.IntentID, a.AgentID, 2, now.Add(-time.Millisecond)); !errors.Is(err, postgres.ErrInvalidTransition) {
+		t.Fatalf("second closure changed ending authority: %v", err)
 	}
 	var generation int64
 	var owner *string
@@ -113,6 +131,22 @@ func TestFlightCompletionClosesExactBindingAndFencesLease(t *testing.T) {
 	}
 	if err = s.RenewAssignmentLease(ctx, *tail, time.Second); err != nil {
 		t.Fatalf("late final claim cannot renew: %v", err)
+	}
+
+	historical := a
+	historical.ID = id + "-historical"
+	historical.AircraftID = historical.ID
+	historical.FlightID = historical.ID
+	past := time.Date(1960, 1, 1, 0, 0, 0, 0, time.UTC)
+	historical.EffectiveFrom = past.Add(-time.Hour)
+	historical.EffectiveUntil = past.Add(time.Hour)
+	historical.Volumes = append([]domain.Volume(nil), a.Volumes...)
+	historical.Volumes[0].StartsAt = historical.EffectiveFrom
+	historical.Volumes[0].EndsAt = historical.EffectiveUntil
+	activateAssignment(t, ctx, s, historical, historical.ID, past.Add(-time.Second))
+	closed, err := s.EndAssignment(ctx, "api", id+"-historic-end", historical.ID, 7, historical.FlightID, historical.AircraftID, historical.IntentID, historical.AgentID, 2, past)
+	if err != nil || closed.AuthorityUntil == nil || !closed.AuthorityUntil.Equal(past.Add(time.Nanosecond)) {
+		t.Fatalf("pre-epoch closure: %+v %v", closed, err)
 	}
 
 }
